@@ -29,11 +29,25 @@ type Config struct {
 	// GitTimeout 是单条 git 命令的超时，Go duration，默认 3m。
 	GitTimeout string `json:"gitTimeout"`
 
+	// GitHubAPIBase 是 GitHub REST API 根地址，默认 https://api.github.com；
+	// GitHub Enterprise 填 https://<host>/api/v3。
+	GitHubAPIBase string `json:"githubApiBase"`
+	// GitHubToken 是 issue 工具使用的默认令牌（PAT，写操作需要 issues:write）；
+	// 可被 repos[].issues.token 覆盖，环境变量 REPOMCP_GITHUB_TOKEN 最优先。
+	GitHubToken string `json:"githubToken"`
+	// GitHubTimeout 是单次 GitHub API 调用超时，Go duration，默认 20s。
+	GitHubTimeout string `json:"githubTimeout"`
+	// MaxIssueCreatesPerHour 限制单仓每小时可创建的 issue 数，默认 5，0 表示不限。
+	// 这是防御性的：模型在对话里反复"帮你提个 issue"是真实风险，提示词约束不住。
+	MaxIssueCreatesPerHour *int `json:"maxIssueCreatesPerHour"`
+
 	Repos []RepoConfig `json:"repos"`
 
 	// 解析后的派生值。
 	syncInterval time.Duration
 	gitTimeout   time.Duration
+	ghTimeout    time.Duration
+	issueLimit   int // 每仓每小时创建上限，0 = 不限
 }
 
 // RepoConfig 是配置文件中的一个仓库条目。
@@ -55,6 +69,21 @@ type RepoConfig struct {
 
 	Include []string `json:"include"`
 	Exclude []string `json:"exclude"`
+
+	// Issues 开启该仓的 issue 能力；省略则该仓不出现在任何 issue 工具里。
+	Issues *RepoIssuesConfig `json:"issues"`
+}
+
+// RepoIssuesConfig 控制单个仓库的 issue 能力。给出空对象 {} 即为「只读检索」。
+type RepoIssuesConfig struct {
+	// Slug 是 owner/repo；留空则从 webBase / url 推导（仅 GitHub 风格地址可推导）。
+	Slug string `json:"slug"`
+	// Write 允许创建 issue、评论与改状态；默认 false，即只读。
+	Write bool `json:"write"`
+	// Token 覆盖全局 githubToken。
+	Token string `json:"token"`
+	// Labels 是允许模型使用的标签白名单；留空表示以仓库现有标签为准。
+	Labels []string `json:"labels"`
 }
 
 var reRepoName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
@@ -85,6 +114,9 @@ func LoadConfig(path string) (*Config, error) {
 	if v := os.Getenv("REPOMCP_DATA"); v != "" {
 		cfg.DataDir = v
 	}
+	if v := os.Getenv("REPOMCP_GITHUB_TOKEN"); v != "" {
+		cfg.GitHubToken = v
+	}
 
 	if cfg.Listen == "" {
 		cfg.Listen = ":8790"
@@ -109,6 +141,20 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.gitTimeout <= 0 {
 		cfg.gitTimeout = 3 * time.Minute
+	}
+	cfg.ghTimeout, err = parseDur(cfg.GitHubTimeout, 20*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("githubTimeout: %w", err)
+	}
+	if cfg.ghTimeout <= 0 {
+		cfg.ghTimeout = 20 * time.Second
+	}
+	cfg.issueLimit = 5
+	if n := cfg.MaxIssueCreatesPerHour; n != nil {
+		if *n < 0 {
+			return nil, errors.New("maxIssueCreatesPerHour 不能为负；0 表示不限")
+		}
+		cfg.issueLimit = *n
 	}
 
 	if len(cfg.Repos) == 0 {
@@ -170,7 +216,7 @@ func (c *Config) BuildRepos() ([]*Repo, error) {
 			web = deriveWebBase(rc.URL)
 		}
 
-		out = append(out, &Repo{
+		r := &Repo{
 			Name:    name,
 			URL:     rc.URL,
 			Ref:     ref,
@@ -178,9 +224,70 @@ func (c *Config) BuildRepos() ([]*Repo, error) {
 			WebBase: web,
 			Include: rc.Include,
 			Exclude: rc.Exclude,
-		})
+		}
+		if err := c.applyIssues(r, rc, i); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
 	return out, nil
+}
+
+var reRepoSlug = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+
+// applyIssues 解析单仓的 issue 配置：推导 slug、挑令牌、校验写能力的前置条件。
+// 写能力必须有令牌——匿名调用 GitHub 根本写不了，与其运行期报 401，不如启动就拒绝。
+func (c *Config) applyIssues(r *Repo, rc RepoConfig, i int) error {
+	if rc.Issues == nil {
+		return nil
+	}
+	slug := strings.Trim(strings.TrimSpace(rc.Issues.Slug), "/")
+	if slug == "" {
+		slug = deriveSlug(r.WebBase, rc.URL)
+	}
+	if slug == "" {
+		return fmt.Errorf("repos[%d] (%s).issues：无法从 url/webBase 推导 owner/repo，请显式填写 issues.slug", i, r.Name)
+	}
+	if !reRepoSlug.MatchString(slug) {
+		return fmt.Errorf("repos[%d] (%s).issues.slug %q 非法：要求 owner/repo 形式", i, r.Name, slug)
+	}
+	token := strings.TrimSpace(rc.Issues.Token)
+	if token == "" {
+		token = strings.TrimSpace(c.GitHubToken)
+	}
+	if rc.Issues.Write && token == "" {
+		return fmt.Errorf("repos[%d] (%s).issues.write=true 但无令牌：请配置 githubToken 或 repos[].issues.token", i, r.Name)
+	}
+	r.Slug = slug
+	r.GHToken = token
+	r.IssueRead = true
+	r.IssueWrite = rc.Issues.Write
+	r.IssueLabels = rc.Issues.Labels
+	return nil
+}
+
+// deriveSlug 从网页前缀（或据 clone 地址推导出的网页前缀）取出 owner/repo。
+func deriveSlug(webBase, url string) string {
+	base := strings.TrimRight(webBase, "/")
+	if base == "" {
+		base = deriveWebBase(url)
+	}
+	if base == "" {
+		return ""
+	}
+	if i := strings.Index(base, "://"); i >= 0 {
+		base = base[i+3:]
+	}
+	// 首段是主机名，其后两段即 owner/repo。
+	parts := strings.Split(strings.Trim(base, "/"), "/")
+	if len(parts) < 3 {
+		return ""
+	}
+	owner, name := parts[1], strings.TrimSuffix(parts[2], ".git")
+	if owner == "" || name == "" {
+		return ""
+	}
+	return owner + "/" + name
 }
 
 // deriveWebBase 从 clone URL 推导网页前缀，支持 https 与 scp 风格 ssh 地址。

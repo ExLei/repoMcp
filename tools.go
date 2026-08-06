@@ -50,7 +50,7 @@ func (s *Server) toolDefs() []toolDef {
 		repoDesc += "（只有一个仓库，可省略）"
 	}
 
-	return []toolDef{
+	defs := []toolDef{
 		{
 			Name:  "repo_overview",
 			Title: "仓库概览",
@@ -117,6 +117,8 @@ func (s *Server) toolDefs() []toolDef {
 			Handle: s.toolGitHistory,
 		},
 	}
+	// issue 工具按配置动态挂载：没接入 issue 的部署仍然只有这 5 个检索工具。
+	return append(defs, s.issueToolDefs()...)
 }
 
 func (s *Server) callTool(ctx context.Context, name string, args map[string]any) (string, error) {
@@ -349,6 +351,13 @@ func (s *Server) toolRepoOverview(_ context.Context, args map[string]any) (strin
 		}
 		if r.WebBase != "" {
 			w.line("仓库地址：" + r.WebBase)
+		}
+		if r.IssueRead {
+			mode := "可检索（search_issues / read_issue）"
+			if r.IssueWrite {
+				mode = "可检索，也可代用户提交与管理（create_issue / update_issue，需先调研并查重）"
+			}
+			w.line("issue：" + mode + " —— " + r.Slug)
 		}
 
 		if lines := s.index.Tree(r.Name, treeLimit); len(lines) > 0 {

@@ -13,6 +13,62 @@ type Repo struct {
 	WebBase string // permalink 前缀，如 https://github.com/owner/repo；空则不产出链接
 	Include []string
 	Exclude []string
+
+	// Slug 是 owner/name 形式的 GitHub 仓库标识；为空表示该仓不提供 issue 能力。
+	Slug string
+	// IssueRead / IssueWrite 决定该仓向模型暴露哪些 issue 工具。
+	// 写能力必须显式开启，且必须配有令牌。
+	IssueRead  bool
+	IssueWrite bool
+	// GHToken 是访问该仓 issue 用的令牌（可能来自全局 githubToken）。
+	GHToken string
+	// IssueLabels 是允许模型使用的标签白名单；空表示以仓库现有标签为准。
+	IssueLabels []string
+}
+
+// Issue 是一条 issue。Body 已把 CRLF 规整为 LF。
+type Issue struct {
+	Number    int
+	Title     string
+	State     string // open / closed
+	Reason    string // state_reason：completed / not_planned / reopened
+	Author    string
+	Labels    []string
+	Comments  int
+	CreatedAt string // YYYY-MM-DD
+	UpdatedAt string
+	URL       string
+	Body      string
+}
+
+// IssueComment 是 issue 下的一条评论。
+type IssueComment struct {
+	Author string
+	Date   string
+	Body   string
+}
+
+// IssueQuery 是一次 issue 检索。Text 为空表示按更新时间列出最近的。
+type IssueQuery struct {
+	Text   string
+	State  string // open / closed / all，空视为 open
+	Labels []string
+	Limit  int
+}
+
+// IssueDraft 是待创建的 issue。Body 由工具层按模板渲染，客户端不能直接控制全文。
+type IssueDraft struct {
+	Title  string
+	Body   string
+	Labels []string
+}
+
+// IssueEdit 是对已有 issue 的修改。State 为空表示不改状态。
+type IssueEdit struct {
+	State        string // open / closed
+	StateReason  string // completed / not_planned
+	AddLabels    []string
+	RemoveLabels []string
 }
 
 // File 是索引中的一个文件快照。Lines 不含行尾换行符。
@@ -107,4 +163,17 @@ type Storer interface {
 	// Log 查询提交历史。path 与 grep 均可为空。
 	Log(ctx context.Context, repo, path, grep string, n int) ([]Commit, error)
 	Blame(ctx context.Context, repo, path string, start, end int) ([]BlameLine, error)
+}
+
+// IssueTracker 是 issue 层对外契约，由 *GitHub 实现。实现必须并发安全。
+// 契约刻意不含任何删除操作：本服务对仓库的写权力上限就是建 issue / 评论 / 改状态与标签。
+type IssueTracker interface {
+	List(ctx context.Context, r *Repo, q IssueQuery) ([]Issue, error)
+	// Get 返回 issue 正文与最近若干条评论。
+	Get(ctx context.Context, r *Repo, number int) (Issue, []IssueComment, error)
+	Create(ctx context.Context, r *Repo, d IssueDraft) (Issue, error)
+	Comment(ctx context.Context, r *Repo, number int, body string) error
+	Edit(ctx context.Context, r *Repo, number int, e IssueEdit) (Issue, error)
+	// RepoLabels 返回仓库现有标签，用于拦截模型编造的标签。
+	RepoLabels(ctx context.Context, r *Repo) ([]string, error)
 }

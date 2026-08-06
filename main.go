@@ -24,15 +24,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
-// Server 持有全部运行时依赖。索引与仓库层各自保证并发安全，Server 本身无状态。
+// Server 持有全部运行时依赖。索引、仓库与 issue 层各自保证并发安全，Server 本身无状态。
 type Server struct {
-	cfg   *Config
-	store *Store
-	index *Index
+	cfg     *Config
+	store   *Store
+	index   *Index
+	gh      *GitHub
+	limiter *issueRateLimiter
 }
 
 func main() {
@@ -54,7 +58,14 @@ func main() {
 		log.Printf("警告：未设置 token，MCP 端点无鉴权。仅应在受信网络或 127.0.0.1 上这样运行。")
 	}
 
-	srv := &Server{cfg: cfg, store: NewStore(repos), index: NewIndex()}
+	srv := &Server{
+		cfg:     cfg,
+		store:   NewStore(repos),
+		index:   NewIndex(),
+		gh:      NewGitHub(cfg.GitHubAPIBase, cfg.ghTimeout),
+		limiter: newIssueRateLimiter(cfg.issueLimit),
+	}
+	logIssueSetup(repos, cfg)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", srv.handleMCP)
@@ -89,6 +100,41 @@ func main() {
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("关闭超时：%v", err)
+	}
+}
+
+// logIssueSetup 把 issue 能力的实际生效情况打到日志。
+// 这类「配置写了但没生效」的问题排查成本极高，启动时讲清楚最省事。
+func logIssueSetup(repos []*Repo, cfg *Config) {
+	var read, write []string
+	for _, r := range repos {
+		if !r.IssueRead {
+			continue
+		}
+		if r.IssueWrite {
+			write = append(write, r.Name+"="+r.Slug)
+			continue
+		}
+		read = append(read, r.Name+"="+r.Slug)
+	}
+	if len(read) == 0 && len(write) == 0 {
+		log.Printf("issue 工具未启用（没有仓库配置 issues 段）")
+		return
+	}
+	if len(read) > 0 {
+		log.Printf("issue 只读：%s", strings.Join(read, " "))
+	}
+	if len(write) > 0 {
+		limit := "不限"
+		if cfg.issueLimit > 0 {
+			limit = strconv.Itoa(cfg.issueLimit) + " 个/小时"
+		}
+		log.Printf("issue 可写：%s（创建上限 %s）", strings.Join(write, " "), limit)
+	}
+	for _, r := range repos {
+		if r.IssueRead && r.GHToken == "" {
+			log.Printf("警告：仓库 %s 的 issue 未配置令牌，只能读公开仓且限流严格（60 次/小时）", r.Name)
+		}
 	}
 }
 
