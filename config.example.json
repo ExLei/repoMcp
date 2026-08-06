@@ -1,0 +1,25 @@
+{
+  "listen": ":8790",
+  "token": "把这里换成一个长随机串，与 LangBot 侧 headers.Authorization 一致",
+  "dataDir": "./data",
+  "syncInterval": "15m",
+  "gitTimeout": "3m",
+  "maxResponseBytes": 12000,
+  "repos": [
+    {
+      "name": "fluxdown",
+      "desc": "多协议下载器主仓：Flutter 桌面/移动端 + Rust 引擎 + 本机 API + Web SPA",
+      "url": "https://github.com/zerx-lab/FluxDown.git",
+      "ref": "main",
+      "webBase": "https://github.com/zerx-lab/FluxDown",
+      "exclude": ["assets/i18n/*.json", "packages/**"]
+    },
+    {
+      "name": "fluxcloud",
+      "desc": "云端服务：账号 / 设备信任 / 套餐权益 / 配置同步（axum + SeaORM）",
+      "url": "https://github.com/zerx-lab/FluxCloud.git",
+      "ref": "main",
+      "webBase": "https://github.com/zerx-lab/FluxCloud"
+    }
+  ]
+}

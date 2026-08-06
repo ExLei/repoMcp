@@ -1,0 +1,36 @@
+# repoMcp 打包脚本（https://taskfile.dev）。
+# `task build`：交叉编译 x64 Linux 单二进制到 build/（零 CGO，任意主机可跑）。
+# `task run`：本机前台运行，读 config.json。
+version: '3'
+
+vars:
+  BUILD_DIR: build
+  BIN: repomcp
+
+tasks:
+  check:
+    desc: 静态检查
+    cmds:
+      - go vet ./...
+
+  build:
+    desc: 打包 x64 Linux 二进制，输出到 build/
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: '0'
+    cmds:
+      - go vet ./...
+      - mkdir -p {{.BUILD_DIR}}
+      - go build -trimpath -ldflags="-s -w" -o {{.BUILD_DIR}}/{{.BIN}} .
+      - echo "打包完成 -> {{.BUILD_DIR}}/{{.BIN}}"
+
+  run:
+    desc: 本机前台运行
+    cmds:
+      - go run . -config config.json
+
+  clean:
+    desc: 清理构建产物
+    cmds:
+      - '{{if eq OS "windows"}}powershell -c "Remove-Item -Recurse -Force {{.BUILD_DIR}} -ErrorAction SilentlyContinue"{{else}}rm -rf {{.BUILD_DIR}}{{end}}'
