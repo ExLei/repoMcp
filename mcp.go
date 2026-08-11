@@ -348,7 +348,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Files    int    `json:"files"`
 		Symbols  int    `json:"symbols"`
 		Indexed  bool   `json:"indexed"`
-		Issues   string `json:"issues"` // off / read / write
+		NoCode   bool   `json:"noCode,omitempty"` // 反馈仓库：无源码，不克隆不索引
+		Issues   string `json:"issues"`           // off / read / write
 		Slug     string `json:"slug,omitempty"`
 		LastSync string `json:"lastSync,omitempty"`
 		Error    string `json:"error,omitempty"`
@@ -364,7 +365,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		st, ok := stats[r.Name]
 		h := repoHealth{
 			Name: r.Name, Head: s.store.Head(r.Name), Files: st.Files, Symbols: st.Symbols,
-			Indexed: ok, Issues: issueMode(r), Slug: r.Slug,
+			Indexed: ok, NoCode: !r.HasCode, Issues: issueMode(r), Slug: r.Slug,
 		}
 		_, last, lerr := s.store.Status(r.Name)
 		if !last.IsZero() {
@@ -372,6 +373,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 		if lerr != nil {
 			h.Error = truncate(lerr.Error(), 200)
+		}
+		if !r.HasCode {
+			// 反馈仓库无源码，不参与就绪判定。
+			out.Repos = append(out.Repos, h)
+			continue
 		}
 		if !ok {
 			ready = false

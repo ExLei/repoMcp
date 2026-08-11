@@ -70,6 +70,10 @@ type RepoConfig struct {
 	Include []string `json:"include"`
 	Exclude []string `json:"exclude"`
 
+	// Code 是否作为源码仓库克隆并索引；false 表示反馈类仓库（无源码，仅 issue 能力）。
+	// 指针语义：缺省 nil = true，显式 "code": false 才关闭，避免遗漏配置误伤现有仓库。
+	Code *bool `json:"code"`
+
 	// Issues 开启该仓的 issue 能力；省略则该仓不出现在任何 issue 工具里。
 	Issues *RepoIssuesConfig `json:"issues"`
 }
@@ -224,6 +228,7 @@ func (c *Config) BuildRepos() ([]*Repo, error) {
 			WebBase: web,
 			Include: rc.Include,
 			Exclude: rc.Exclude,
+			HasCode: rc.Code == nil || *rc.Code,
 		}
 		if err := c.applyIssues(r, rc, i); err != nil {
 			return nil, err

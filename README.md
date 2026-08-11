@@ -33,14 +33,25 @@
 | `find_symbol` | 按名字查定义，返回签名与文档注释。已知符号名时比 `search_code` 精确 |
 | `git_history` | 提交历史，回答「为什么这么写」「什么时候加的」 |
 
-**issue（配置了 `repos[].issues` 才挂载）**
+**issue / PR 查询（无条件挂载，任意公开仓库只读）**
 
-| 工具 | 用途 | 前提 |
+| 工具 | 用途 |
+|---|---|
+| `search_issues` | 查已有 issue：回答「有人提过吗 / 现在有哪些待办」，也是创建前的查重手段 |
+| `read_issue` | 读单条 issue 的完整正文与最近讨论 |
+| `list_releases` | 查询 GitHub Releases 发布记录 |
+| `search_pulls` | 列出 PR（状态筛选），回答「有哪些 PR / 有人提 PR 吗」 |
+| `read_pull` | 读单个 PR 的完整描述、状态与分支信息 |
+| `list_pull_comments` | 列 PR 的讨论评论 |
+
+`repo` 参数支持配置短名或任意公开仓库 `owner/name`（如 `example-owner/AstrBot`）。
+
+**issue 写入（配置了 `repos[].issues.write` 才挂载）**
+
+| 工具 | 用途 | 权限 |
 |---|---|---|
-| `search_issues` | 查已有 issue：回答「有人提过吗 / 现在有哪些待办」，也是创建前的查重手段 | `issues` 已配置 |
-| `read_issue` | 读单条 issue 的完整正文与最近讨论 | 同上 |
-| `create_issue` | 代用户提交 issue，正文由服务端按模板渲染 | `issues.write: true` |
-| `update_issue` | 追加评论、关闭、重开、增删标签 | 同上 |
+| `create_issue` | 代用户提交 issue，正文由服务端按模板渲染 | 仅配置的可写仓库；管理员（`adminReporters`）可对任意仓库（token 可访问的）写入 |
+| `update_issue` | 追加评论、关闭、重开、增删标签 | 同上；**追加评论（action=comment）仅管理员可执行** |
 
 服务在 `initialize` 时会下发 `instructions`，向模型声明可用仓库、各仓的 issue 能力、工具选择规则，以及**必须引用来源、检索无果时不得编造**。
 
@@ -57,13 +68,15 @@
   "maxResponseBytes": 12000,
   "githubToken": "有 issues 权限的 PAT",
   "maxIssueCreatesPerHour": 5,
+  "adminReporters": ["管理员甲", "100000001"],
+  "astrbotAdminsFile": "/AstrBot/data/cmd_config.json",
   "repos": [
     {
-      "name": "fluxdown",
+      "name": "example-source",
       "desc": "多协议下载器主仓（这句话会展示给模型，帮它选对仓库）",
-      "url": "https://github.com/zerx-lab/FluxDown.git",
+      "url": "https://github.com/upstream-owner/ExampleSource.git",
       "ref": "main",
-      "webBase": "https://github.com/zerx-lab/FluxDown",
+      "webBase": "https://github.com/upstream-owner/ExampleSource",
       "exclude": ["packages/**"],
       "issues": { "write": true }
     }
@@ -146,8 +159,8 @@ LangBot 的 MCP 配置里新增一个 HTTP server：
 | 强制查重 | 创建前服务端自己再查一遍，命中疑似重复直接拒绝并列出候选；模型只能在逐条核对后带 `confirm_not_duplicate=true` 重试 |
 | 双路召回 | 搜索接口覆盖历史 issue，最近 open 列表兜底中文标题（GitHub 搜索对 CJK 分词很差）。标题按重叠系数打分，阈值 0.55 |
 | 频率上限 | 每仓每小时最多 `maxIssueCreatesPerHour` 个。配额在调用 GitHub **之前**扣除，失败重试也照扣 |
-| 必填调研结论 | `confidence` 只能是 `confirmed` / `unconfirmed`；`confirmed` 时 `evidence` 里没有 `路径:行号` 形式的出处直接拒绝 |
-| 正文服务端渲染 | 模型只能填各段内容，结构固定：现象 → 调研结论（带确定性标注）→ 复现 → 环境 → 提交来源 |
+| 调研结论 | `confidence` 只能是 `confirmed` / `unconfirmed`；源码仓库必填，反馈仓库（无源码）可省略（默认 unconfirmed）；`confirmed` 时 `evidence` 里没有 `路径:行号` 形式的出处直接拒绝 |
+| 正文服务端渲染 | 模型只能填各段内容，结构固定：问题描述 → 复现 / 触发条件（可省略）→ 环境（必填）→ 调研结论（仅源码仓库）→ 提交来源 |
 | 标签白名单 | GitHub 打标签会顺手新建不存在的标签；只有仓库现有（或配置白名单里的）标签会被采用，其余忽略并在结果里说明 |
 | 状态变更要理由 | `close` 必须同时给 `comment`（≥10 字结论）与 `reason`（`completed` / `not_planned`）；重复关闭已关闭的 issue 会被拒绝 |
 | 仓库必须对得上 | 有多个可写仓时 `repo` 不可省略；对未接入 issue 的仓库调用会明确说明原因，而不是退而求其次挑一个 |

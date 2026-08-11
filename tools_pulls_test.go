@@ -27,8 +27,8 @@ func TestPullStateText(t *testing.T) {
 }
 
 func TestPullMetaLine(t *testing.T) {
-	line := pullMetaLine(PR{Author: "soulter", UpdatedAt: "2026-08-01"})
-	if !strings.Contains(line, "soulter") || !strings.Contains(line, "2026-08-01") {
+	line := pullMetaLine(PR{Author: "example-owner", UpdatedAt: "2026-08-01"})
+	if !strings.Contains(line, "example-owner") || !strings.Contains(line, "2026-08-01") {
 		t.Errorf("pullMetaLine 输出缺字段: %q", line)
 	}
 }

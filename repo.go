@@ -189,9 +189,13 @@ func (s *Store) Status(repo string) (head string, lastSync time.Time, lastErr er
 }
 
 // Sync 对每个仓库执行克隆或增量拉取；单仓失败不影响其它仓库，全部结果用 errors.Join 聚合返回。
+// 反馈仓库（HasCode=false）不克隆不拉取。
 func (s *Store) Sync(ctx context.Context) error {
 	var errs []error
 	for _, r := range s.repos {
+		if !r.HasCode {
+			continue
+		}
 		if err := s.stSyncOne(ctx, r); err != nil {
 			errs = append(errs, fmt.Errorf("repo %s: %w", r.Name, err))
 		}
@@ -311,7 +315,7 @@ func (s *Store) Head(repo string) string {
 	}
 
 	r, ok := s.byName[repo]
-	if !ok {
+	if !ok || !r.HasCode {
 		return ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -484,6 +488,9 @@ func (s *Store) Log(ctx context.Context, repo, path, grep string, n int) ([]Comm
 	if !ok {
 		return nil, fmt.Errorf("unknown repo: %s", repo)
 	}
+	if !r.HasCode {
+		return nil, fmt.Errorf("%s 为反馈仓库（无源码），不提供代码检索与提交历史", repo)
+	}
 	if n <= 0 {
 		n = 10
 	}
@@ -592,6 +599,9 @@ func (s *Store) Blame(ctx context.Context, repo, path string, start, end int) ([
 	r, ok := s.byName[repo]
 	if !ok {
 		return nil, fmt.Errorf("unknown repo: %s", repo)
+	}
+	if !r.HasCode {
+		return nil, fmt.Errorf("%s 为反馈仓库（无源码），不提供代码检索与提交历史", repo)
 	}
 	safePath, ok := stSafeRelPath(path)
 	if !ok {

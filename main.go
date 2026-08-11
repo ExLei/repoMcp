@@ -176,6 +176,9 @@ func (s *Server) syncOnce(ctx context.Context) {
 			log.Printf("同步超时，剩余仓库本轮跳过")
 			return
 		}
+		if !r.HasCode {
+			continue // 反馈仓库无源码，不加载不索引
+		}
 		t0 := time.Now()
 		files, err := s.store.Load(r)
 		if err != nil {

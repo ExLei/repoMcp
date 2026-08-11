@@ -5,26 +5,40 @@
   "syncInterval": "15m",
   "gitTimeout": "3m",
   "maxResponseBytes": 12000,
-
   "githubToken": "有 issues 读写权限的 PAT；也可用环境变量 REPOMCP_GITHUB_TOKEN",
   "maxIssueCreatesPerHour": 5,
   "repos": [
     {
-      "name": "fluxdown",
+      "name": "example-source",
       "desc": "多协议下载器主仓：Flutter 桌面/移动端 + Rust 引擎 + 本机 API + Web SPA",
-      "url": "https://github.com/zerx-lab/FluxDown.git",
+      "url": "https://github.com/upstream-owner/ExampleSource.git",
       "ref": "main",
-      "webBase": "https://github.com/zerx-lab/FluxDown",
-      "exclude": ["assets/i18n/*.json", "packages/**"],
-      "issues": { "write": true, "labels": ["bug", "enhancement", "question"] }
+      "webBase": "https://github.com/upstream-owner/ExampleSource",
+      "exclude": [
+        "assets/i18n/*.json",
+        "packages/**"
+      ],
+      "issues": {
+        "write": true,
+        "labels": [
+          "bug",
+          "enhancement",
+          "question"
+        ]
+      }
     },
     {
-      "name": "fluxcloud",
+      "name": "example-readonly",
       "desc": "云端服务：账号 / 设备信任 / 套餐权益 / 配置同步（axum + SeaORM）",
-      "url": "https://github.com/zerx-lab/FluxCloud.git",
+      "url": "https://github.com/upstream-owner/ExampleReadonly.git",
       "ref": "main",
-      "webBase": "https://github.com/zerx-lab/FluxCloud",
+      "webBase": "https://github.com/upstream-owner/ExampleReadonly",
       "issues": {}
     }
-  ]
+  ],
+  "adminReporters": [
+    "管理员甲",
+    "100000001"
+  ],
+  "astrbotAdminsFile": "/AstrBot/data/cmd_config.json"
 }

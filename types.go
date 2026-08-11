@@ -14,6 +14,11 @@ type Repo struct {
 	Include []string
 	Exclude []string
 
+	// HasCode 表示该仓库是否作为源码仓库克隆与索引。
+	// false = 反馈类仓库（无源码，仅 issue 能力）：不 clone、不索引，
+	// 代码工具（search_code 等）不可用，create_issue 跳过源码调研。
+	HasCode bool
+
 	// Slug 是 owner/name 形式的 GitHub 仓库标识；为空表示该仓不提供 issue 能力。
 	Slug string
 	// IssueRead / IssueWrite 决定该仓向模型暴露哪些 issue 工具。
@@ -48,6 +53,15 @@ type IssueComment struct {
 	Body   string
 }
 
+// Release 是一个 GitHub Release。Body 已把 CRLF 规整为 LF。
+type Release struct {
+	Tag         string // tag_name，如 v0.1.0
+	Name        string // 发布标题，可能为空
+	Body        string // 发布说明全文
+	PublishedAt string // 发布日期 YYYY-MM-DD
+	URL         string // html_url
+}
+
 // IssueQuery 是一次 issue 检索。Text 为空表示按更新时间列出最近的。
 type IssueQuery struct {
 	Text   string
@@ -67,6 +81,8 @@ type IssueDraft struct {
 type IssueEdit struct {
 	State        string // open / closed
 	StateReason  string // completed / not_planned
+	Title        string // 新标题，空表示不改
+	Body         string // 新正文，空表示不改
 	AddLabels    []string
 	RemoveLabels []string
 }
@@ -176,4 +192,6 @@ type IssueTracker interface {
 	Edit(ctx context.Context, r *Repo, number int, e IssueEdit) (Issue, error)
 	// RepoLabels 返回仓库现有标签，用于拦截模型编造的标签。
 	RepoLabels(ctx context.Context, r *Repo) ([]string, error)
+	// Releases 返回仓库最近 n 个发布（不含草稿），用于回答版本类问题。
+	Releases(ctx context.Context, r *Repo, n int) ([]Release, error)
 }

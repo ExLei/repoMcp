@@ -102,6 +102,15 @@ type ghCommentJSON struct {
 	} `json:"user"`
 }
 
+type ghReleaseJSON struct {
+	TagName     string    `json:"tag_name"`
+	Name        string    `json:"name"`
+	Body        string    `json:"body"`
+	Draft       bool      `json:"draft"`
+	PublishedAt time.Time `json:"published_at"`
+	HTMLURL     string    `json:"html_url"`
+}
+
 func (j ghIssueJSON) toIssue() Issue {
 	out := Issue{
 		Number:   j.Number,
@@ -455,6 +464,36 @@ func (g *GitHub) PRComments(ctx context.Context, r *Repo, number, limit int) ([]
 	return out, nil
 }
 
+// Releases 返回仓库最近 n 个发布。草稿不算发布（draft=true 的条目跳过），
+// 否则「最新版本」会答出还没公开的草稿；pre-release 保留，它是真实发布的版本。
+func (g *GitHub) Releases(ctx context.Context, r *Repo, n int) ([]Release, error) {
+	if n <= 0 {
+		n = 5
+	}
+	n = min(n, 20)
+	v := url.Values{}
+	v.Set("per_page", strconv.Itoa(n))
+
+	var raw []ghReleaseJSON
+	if err := g.do(ctx, r, http.MethodGet, "/repos/"+r.Slug+"/releases?"+v.Encode(), nil, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]Release, 0, len(raw))
+	for _, j := range raw {
+		if j.Draft {
+			continue
+		}
+		out = append(out, Release{
+			Tag:         j.TagName,
+			Name:        j.Name,
+			Body:        strings.ReplaceAll(j.Body, "\r\n", "\n"),
+			PublishedAt: j.PublishedAt.UTC().Format("2006-01-02"),
+			URL:         j.HTMLURL,
+		})
+	}
+	return out, nil
+}
+
 // Get 返回 issue 正文与最近若干条评论。评论取不到不影响正文返回——
 // 正文是主要证据，为了评论把整次调用判失败不划算。
 func (g *GitHub) Get(ctx context.Context, r *Repo, number int) (Issue, []IssueComment, error) {
@@ -563,13 +602,22 @@ func (g *GitHub) Edit(ctx context.Context, r *Repo, number int, e IssueEdit) (Is
 	}
 
 	var j ghIssueJSON
-	if e.State == "" {
+	if e.State == "" && e.Title == "" && e.Body == "" {
 		if err := g.do(ctx, r, http.MethodGet, base, nil, &j); err != nil {
 			return Issue{}, err
 		}
 		return j.toIssue(), nil
 	}
-	payload := map[string]any{"state": e.State}
+	payload := make(map[string]any, 4)
+	if e.Title != "" {
+		payload["title"] = e.Title
+	}
+	if e.Body != "" {
+		payload["body"] = e.Body
+	}
+	if e.State != "" {
+		payload["state"] = e.State
+	}
 	if e.State == "closed" && e.StateReason != "" {
 		payload["state_reason"] = e.StateReason
 	}

@@ -288,6 +288,9 @@ func (s *Server) notReady(repos []*Repo) string {
 	stats := s.index.Stats()
 	var pending []string
 	for _, r := range repos {
+		if !r.HasCode {
+			continue // 反馈仓库不索引，不列入待索引提示
+		}
 		if _, ok := stats[r.Name]; !ok {
 			msg := r.Name
 			if _, _, err := s.store.Status(r.Name); err != nil {
@@ -328,6 +331,24 @@ func (s *Server) toolRepoOverview(_ context.Context, args map[string]any) (strin
 	for i, r := range repos {
 		if i > 0 && !w.line("") {
 			break
+		}
+		if !r.HasCode {
+			// 反馈仓库：无源码可检索，只展示说明与 issue 能力。
+			if !w.line("## " + r.Name) {
+				break
+			}
+			if d := s.cfg.desc(r.Name); d != "" {
+				w.line(d)
+			}
+			w.line("状态：反馈仓库，无源码，不提供代码检索与提交历史。")
+			if r.IssueRead {
+				mode := "可检索（search_issues / read_issue）"
+				if r.IssueWrite {
+					mode = "可检索，也可代用户提交与管理（create_issue / update_issue，反馈仓库无需源码调研，仍需查重）"
+				}
+				w.line("issue：" + mode + " —— " + r.Slug)
+			}
+			continue
 		}
 		st, indexed := stats[r.Name]
 		head := s.shortHead(r.Name)
@@ -448,6 +469,9 @@ func (s *Server) toolSearchCode(_ context.Context, args map[string]any) (string,
 	if err != nil {
 		return "", err
 	}
+	if target != nil && !target.HasCode {
+		return "", fmt.Errorf("%s 为反馈仓库（无源码），不提供代码检索。反馈请用 create_issue", target.Name)
+	}
 	scope := s.store.Repos()
 	repoName := ""
 	if target != nil {
@@ -524,6 +548,9 @@ func (s *Server) toolReadFile(ctx context.Context, args map[string]any) (string,
 	target, err := s.resolveRepo(args, false)
 	if err != nil {
 		return "", err
+	}
+	if target != nil && !target.HasCode {
+		return "", fmt.Errorf("%s 为反馈仓库（无源码），不提供代码检索。反馈请用 create_issue", target.Name)
 	}
 
 	var (
@@ -627,6 +654,9 @@ func (s *Server) toolFindSymbol(_ context.Context, args map[string]any) (string,
 	if err != nil {
 		return "", err
 	}
+	if target != nil && !target.HasCode {
+		return "", fmt.Errorf("%s 为反馈仓库（无源码），不提供代码检索。反馈请用 create_issue", target.Name)
+	}
 	repoName := ""
 	if target != nil {
 		repoName = target.Name
@@ -673,6 +703,9 @@ func (s *Server) toolGitHistory(ctx context.Context, args map[string]any) (strin
 	target, err := s.resolveRepo(args, true)
 	if err != nil {
 		return "", err
+	}
+	if !target.HasCode {
+		return "", fmt.Errorf("%s 为反馈仓库（无源码），不提供提交历史。反馈请用 create_issue", target.Name)
 	}
 	path := argStr(args, "path")
 	query := argStr(args, "query")

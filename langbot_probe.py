@@ -12,7 +12,7 @@ import httpx
 from mcp import ClientSession
 
 # 可用环境变量覆盖，便于打线上地址：
-#   REPOMCP_PROBE_URL=https://repomcp.zerx.dev/mcp REPOMCP_PROBE_TOKEN=xxx
+#   REPOMCP_PROBE_URL=https://repo.example.com/mcp REPOMCP_PROBE_TOKEN=xxx
 URL = os.getenv("REPOMCP_PROBE_URL", "http://127.0.0.1:8790/mcp")
 HEADERS = {"Authorization": "Bearer " + os.getenv("REPOMCP_PROBE_TOKEN", "test-token-abc123")}
 
@@ -64,13 +64,13 @@ async def main():
             print("\n".join(rd["content"][0]["text"].splitlines()[:n]))
 
         print("\n--- tools/call: find_symbol ---")
-        show(await session.call_tool("find_symbol", {"name": "aria2StatusStr", "repo": "fluxdown"}))
+        show(await session.call_tool("find_symbol", {"name": "aria2StatusStr", "repo": "example-source"}))
 
         print("\n--- tools/call: search_code（跨仓）---")
         show(await session.call_tool("search_code", {"query": "jsDelivr 测速", "k": 2}), 5)
 
         print("\n--- tools/call: 错误路径应为 isError 而非协议异常 ---")
-        show(await session.call_tool("read_file", {"repo": "fluxdown", "path": "nope.rs"}), 2)
+        show(await session.call_tool("read_file", {"repo": "example-source", "path": "nope.rs"}), 2)
 
         print("\n--- ping ---")
         await session.send_ping()
