@@ -29,7 +29,7 @@ const (
 	issueTitleMinRunes = 6
 	issueTitleMaxRunes = 200
 	issueBodyMinRunes  = 20
-	issueEvidMinRunes  = 10
+	issueEvidMinRunes  = 2
 	issueNoteMinRunes  = 10
 )
 
@@ -111,6 +111,23 @@ func issueRepoList(rs []*Repo) string {
 	return strings.Join(names, " / ")
 }
 
+// issueRepoListAnnotated 标注每个仓库是否源码仓，用于工具参数描述：
+// 模型据此决定哪些仓库需要先做源码调研、哪些直接整理用户报告。
+func issueRepoListAnnotated(rs []*Repo) string {
+	names := make([]string, 0, len(rs))
+	for _, r := range rs {
+		if r.HasCode {
+			names = append(names, r.Name+"（源码仓库，创建前需调研）")
+		} else {
+			names = append(names, r.Name+"（反馈仓库，无源码，无需源码调研）")
+		}
+	}
+	if len(names) == 0 {
+		return "（无）"
+	}
+	return strings.Join(names, " / ")
+}
+
 // issueMode 是单仓 issue 能力的机器可读形态，供 /healthz 使用。
 func issueMode(r *Repo) string {
 	switch {
@@ -127,6 +144,9 @@ func issueMode(r *Repo) string {
 // 只有唯一候选时才允许省略：把 issue 提错仓库比不提更糟，这里绝不猜。
 func (s *Server) resolveIssueRepo(args map[string]any, write bool) (*Repo, error) {
 	cands := s.issueRepos(write)
+	if write && s.isAdminReporter(argStr(args, "reporter")) {
+		return s.resolveAdminWriteRepo(args, cands)
+	}
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("当前没有任何仓库开启 issue %s能力", map[bool]string{true: "写入", false: "检索"}[write])
 	}
@@ -152,20 +172,108 @@ func (s *Server) resolveIssueRepo(args map[string]any, write bool) (*Repo, error
 	return nil, fmt.Errorf("未知仓库 %q，可用：%s", name, issueRepoList(cands))
 }
 
+// resolveAdminWriteRepo 解析管理员（写模式）的 repo 参数：
+// 管理员可对任意仓库（token 可访问，含未配置仓库）写入/修改；
+// 命中白名单短名用配置仓库，否则按 owner/name 构造只读令牌仓库。
+func (s *Server) resolveAdminWriteRepo(args map[string]any, cands []*Repo) (*Repo, error) {
+	raw := strings.TrimSpace(argStr(args, "repo"))
+	name := strings.ToLower(raw)
+	if name == "" {
+		if len(cands) == 1 {
+			return cands[0], nil
+		}
+		return nil, fmt.Errorf("必须指定 repo：owner/name 形式（如 example-owner/AstrBot）或配置短名")
+	}
+	if r, ok := s.store.Get(name); ok {
+		return r, nil
+	}
+	if reRepoSlug.MatchString(name) {
+		return &Repo{Name: raw, Slug: raw, GHToken: s.cfg.GitHubToken}, nil
+	}
+	return nil, fmt.Errorf("未知仓库 %q：用 owner/name 形式（如 example-owner/AstrBot）或配置短名", raw)
+}
+
+// splitReporter 拆「昵称(QQ号)」为（昵称, QQ号）；无括号时纯数字视为 QQ 号。
+func splitReporter(reporter string) (string, string) {
+	r := strings.TrimSpace(reporter)
+	if i := strings.LastIndex(r, "("); i > 0 && strings.HasSuffix(r, ")") {
+		return strings.TrimSpace(r[:i]), strings.TrimSpace(r[i+1 : len(r)-1])
+	}
+	if r != "" && strings.Trim(r, "0123456789") == "" {
+		return "", r
+	}
+	return r, ""
+}
+
+// isAdminReporter 判断 reporter 是否命中管理员名单（昵称 / QQ 号 / 完整格式任一匹配）。
+func (s *Server) isAdminReporter(reporter string) bool {
+	r := strings.TrimSpace(reporter)
+	if r == "" {
+		return false
+	}
+	nick, qq := splitReporter(r)
+	for _, a := range s.cfg.AdminReporters {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if a == r {
+			return true
+		}
+		an, aq := splitReporter(a)
+		if an != "" && nick != "" && an == nick {
+			return true
+		}
+		if aq != "" && qq != "" && aq == qq {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveReadRepo 解析只读查询的 repo 参数：
+// - 配置短名 → 该配置仓库（能力按配置，可走代码/索引）；
+// - owner/name 形式 → 任意公开仓库的只读查询（不参与写入，不建索引）。
+// 写操作仍必须走 resolveIssueRepo(true)，白名单之外一律只读。
+func (s *Server) resolveReadRepo(args map[string]any) (*Repo, error) {
+	raw := strings.TrimSpace(argStr(args, "repo"))
+	name := strings.ToLower(raw)
+	if name == "" {
+		cands := s.issueRepos(false)
+		if len(cands) == 1 {
+			return cands[0], nil
+		}
+		if len(cands) == 0 {
+			return nil, fmt.Errorf("必须指定 repo：任意公开仓库用 owner/name 形式（如 example-owner/AstrBot）")
+		}
+		return nil, fmt.Errorf("必须指定 repo：配置短名（%s）或任意公开仓库 owner/name", issueRepoList(cands))
+	}
+	if r, ok := s.store.Get(name); ok {
+		if !r.IssueRead {
+			return nil, fmt.Errorf("仓库 %s 未接入 issue；查询任意公开仓库请用 owner/name 形式", name)
+		}
+		return r, nil
+	}
+	if reRepoSlug.MatchString(name) {
+		return &Repo{Name: raw, Slug: raw, GHToken: s.cfg.GitHubToken}, nil
+	}
+	return nil, fmt.Errorf("未知仓库 %q：用配置短名或 owner/name 形式（如 example-owner/AstrBot）", raw)
+}
+
 // ── 工具定义 ────────────────────────────────────────────────
 
 // issueToolDefs 按配置动态产出 issue 工具：没开写能力就根本不暴露 create/update。
 // 工具不存在比工具存在但被拒绝更有效——模型看不见的能力不会去尝试。
 func (s *Server) issueToolDefs() []toolDef {
 	readable := s.issueRepos(false)
-	if len(readable) == 0 {
-		return nil
-	}
 	writable := s.issueRepos(true)
 
-	repoDesc := "仓库短名，取值：" + issueRepoList(readable)
+	repoDesc := "仓库：配置短名（" + issueRepoListAnnotated(readable) + "），或任意公开仓库 owner/name（如 example-owner/AstrBot）"
 	if len(readable) == 1 {
-		repoDesc += "（只有一个，可省略）"
+		repoDesc += "（只有一个配置仓库，可省略）"
+	}
+	if len(readable) == 0 {
+		repoDesc = "任意公开仓库 owner/name（如 example-owner/AstrBot）"
 	}
 
 	defs := []toolDef{
@@ -196,13 +304,24 @@ func (s *Server) issueToolDefs() []toolDef {
 			}, "number"),
 			Handle: s.toolReadIssue,
 		},
+		{
+			Name:  "list_releases",
+			Title: "查看发布记录",
+			Desc: "查询仓库的 GitHub Releases 发布记录，用于回答「最新版本是什么 / 有没有新版本 / 发布公告 / 更新了什么」类问题。" +
+				"结果以 GitHub Releases 页面为准。只读查询，支持任意公开仓库。",
+			Schema: obj(map[string]any{
+				"repo":  str(repoDesc),
+				"limit": integer("最多返回几个 release，默认 5", 1, 20),
+			}),
+			Handle: s.toolListReleases,
+		},
 	}
 
 	if len(writable) == 0 {
 		return defs
 	}
 
-	writeDesc := "仓库短名，取值：" + issueRepoList(writable)
+	writeDesc := "仓库短名，取值：" + issueRepoListAnnotated(writable) + "；管理员可填任意 owner/name（token 可访问的仓库）"
 	if len(writable) == 1 {
 		writeDesc += "（只有一个，可省略）"
 	}
@@ -213,25 +332,31 @@ func (s *Server) issueToolDefs() []toolDef {
 			Title: "创建 issue",
 			Desc: "在仓库里创建一个新 issue。这是真实写入，别人会收到通知，必须同时满足以下条件才可调用：\n" +
 				"1) 用户报告的是缺陷、异常或功能需求——单纯的用法提问、你查代码就能答的问题，直接回答，不要开 issue；\n" +
-				"2) 你已经用 search_code / find_symbol / read_file 对问题做过调研（无论是否查到，结论都要写进 evidence）；\n" +
+				"2) 源码仓库：你已经用 search_code / find_symbol / read_file 做过调研，结论写进 evidence（仅服务端判断，不写入正文）；" +
+				"反馈仓库（无源码，见 repo 参数说明）：跳过调研，直接整理用户报告；\n" +
 				"3) 你已经用 search_issues（state=all）查过重，确认没有相同问题；\n" +
 				"4) 问题确实属于这个仓库——不属于任何已接入仓库的问题不要硬提。\n" +
 				"服务端会再做一次自动查重并限制创建频率；命中疑似重复会拒绝创建并列出候选。\n" +
+				"issue 署名（由聊天机器人代 xxx 提交）由服务端统一渲染，不要在 body 参数里自行编写署名行。\n" +
 				"创建成功后把编号和链接告诉用户，同一问题不要再提第二次。",
 			Schema: obj(map[string]any{
 				"title": str("一句话标题：用户视角描述现象，不要写成「修复 xxx」。示例：多任务并发时进度条偶发不刷新"),
-				"body":  str("问题描述：用户做了什么、期望什么、实际发生什么。原样保留用户给出的报错文本"),
-				"confidence": str("调研结论的确定性，二选一：" +
-					"confirmed=已在源码中定位到相关实现且能给出出处；unconfirmed=没能定位，需要维护者核实。不确定就填 unconfirmed，不要硬凑"),
-				"evidence": str("调研过程与依据。confirmed 时写出 路径:行号 及你的判断；" +
-					"unconfirmed 时写清你检索了哪些关键词、看了哪些文件、为什么无法确认"),
-				"repro":                 str("复现步骤或触发条件（缺陷类强烈建议填写）"),
-				"env":                   str("用户报告的版本 / 系统 / 环境信息"),
-				"reporter":              str("报告人标识（IM 昵称等），会写进 issue 正文以便追溯"),
-				"labels":                str("标签，多个用逗号分隔。只有仓库已存在的标签会被采用，其余自动忽略"),
+				"body": str("纯文本问题描述，直接写内容：Bug 报告依次写「问题描述 → 期望行为 → 实际行为」三节；" +
+					"功能需求依次写「问题或需求 → 期望的解决方案 → 使用场景 → 优先级」；提问依次写「问题类型 → 问题描述」。" +
+					"不要添加任何 Markdown 标题或编号（段落标题由服务端渲染）；原样保留用户给出的报错文本；" +
+					"复现步骤填 repro 参数、版本系统等填 env 参数；事实性字段值必须来自用户原话，未提供的必填字段标「未提供」，禁止编造（问题场景等分类判断除外）"),
+				"confidence": str("调研结论的确定性：" +
+					"confirmed=已在源码中定位到相关实现且能给出出处；unconfirmed=没能定位，需要维护者核实。不确定就填 unconfirmed，不要硬凑。" +
+					"反馈仓库（无源码）可省略（默认 unconfirmed）"),
+				"evidence": str("调研结论（简短，仅服务端判断，不写入正文）：confirmed 写 路径:行号 及判断；" +
+					"unconfirmed 写「未定位」即可；反馈仓库无需填写。禁止写检索过程细节（关键词、看过哪些文件、为什么找不到）"),
+				"repro":                 str("复现步骤或触发条件，按用户原话组织；用户未提供时标「未提供」，非缺陷类可省略"),
+				"env":                   str("软件版本 / 操作系统 / 安装方式 / 问题场景，逐项填写；只需向用户确认软件版本，问题场景按描述推断（分类判断，非用户原话），其余用户未提供的标「未提供」"),
+				"reporter":              str("报告人：昵称，可附 QQ 号（格式：昵称(QQ号)，如 张三(QQ12345)），渲染进署名；无法确定 QQ 号时只填昵称"),
+				"labels":                str("标签，多个用逗号分隔：Bug 用 bug、功能需求用 enhancement、提问用 question；只有仓库已存在的标签会被采用，其余自动忽略"),
 				"repo":                  str(writeDesc),
 				"confirm_not_duplicate": boolean("仅在服务端查重拒绝、且你逐条读过候选确认都不是同一问题后才置 true"),
-			}, "title", "body", "confidence", "evidence"),
+			}, "title", "body", "env"),
 			Handle: s.toolCreateIssue,
 		},
 		toolDef{
@@ -241,14 +366,18 @@ func (s *Server) issueToolDefs() []toolDef {
 				"- 补充信息一律用 comment，不要为同一问题另开 issue；\n" +
 				"- 只有在用户明确要求，或问题确已解决/确认不做时才 close，且必须用 comment 写清结论；\n" +
 				"- 不要为了「清理」而批量关闭，一次只处理一个编号；\n" +
+				"- 追加评论（action=comment）仅管理员可执行（adminReporters 名单），非管理员会被拒绝；\n" +
 				"- 不确定是否该关时，改为 comment 说明情况，把决定权留给维护者。",
 			Schema: obj(map[string]any{
 				"number":        integer("issue 编号（不带 #）", 1, 1000000),
-				"action":        str("comment（默认，仅评论）/ close（关闭）/ reopen（重新打开）"),
+				"action":        str("comment（默认，仅评论）/ close（关闭）/ reopen（重新打开）/ edit_title（改标题）/ edit_body（改正文）"),
 				"comment":       str("要追加的评论。close 与 reopen 必填，需说明结论或理由"),
 				"reason":        str("关闭原因，close 时必填：completed=已解决 / not_planned=不予处理或无法复现"),
+				"title":         str("新标题，action=edit_title 时必填，长度 6–200 字"),
+				"body":          str("新正文，action=edit_body 时必填。会替换整篇正文，请保留用户原始报告内容，不足 20 字会被拒绝"),
 				"add_labels":    str("要添加的标签，逗号分隔；只有仓库已存在的标签会被采用"),
 				"remove_labels": str("要移除的标签，逗号分隔"),
+				"reporter":      str("操作者：昵称(QQ号)，如 张三(QQ12345)。追加评论（action=comment）仅管理员可执行；管理员的其他修改操作可作用于任意仓库（token 可访问的），非管理员仅限配置仓库"),
 				"repo":          str(writeDesc),
 			}, "number"),
 			Handle: s.toolUpdateIssue,
@@ -259,7 +388,7 @@ func (s *Server) issueToolDefs() []toolDef {
 // ── search_issues ──────────────────────────────────────────
 
 func (s *Server) toolSearchIssues(ctx context.Context, args map[string]any) (string, error) {
-	r, err := s.resolveIssueRepo(args, false)
+	r, err := s.resolveReadRepo(args)
 	if err != nil {
 		return "", err
 	}
@@ -285,7 +414,11 @@ func (s *Server) toolSearchIssues(ctx context.Context, args map[string]any) (str
 		if state == "open" {
 			w.line("提示：查重时用 state=all，已关闭的 issue 里可能已有结论。")
 		}
-		w.line("若这是用户新报告的缺陷或需求：先用 search_code / find_symbol 调研，再用 create_issue 提交（无法定位也要如实写明）。")
+		if r.IssueWrite {
+			w.line("若这是用户新报告的缺陷或需求：先用 search_code / find_symbol 调研，再用 create_issue 提交（无法定位也要如实写明）。")
+		} else {
+			w.line("该仓库为只读查询（非本服务可写仓库）：需要反馈时引导用户到该项目的仓库页面提交。")
+		}
 		return w.String(), nil
 	}
 
@@ -313,7 +446,7 @@ func (s *Server) toolSearchIssues(ctx context.Context, args map[string]any) (str
 // ── read_issue ─────────────────────────────────────────────
 
 func (s *Server) toolReadIssue(ctx context.Context, args map[string]any) (string, error) {
-	r, err := s.resolveIssueRepo(args, false)
+	r, err := s.resolveReadRepo(args)
 	if err != nil {
 		return "", err
 	}
@@ -372,7 +505,105 @@ func (s *Server) toolReadIssue(ctx context.Context, args map[string]any) (string
 	return w.String(), nil
 }
 
+// ── list_releases ──────────────────────────────────────────
+
+// releaseSummary 把发布说明压成单行摘要：折叠空白，取前 200 字。
+func releaseSummary(body string) string {
+	fields := strings.Fields(strings.TrimSpace(body))
+	if len(fields) == 0 {
+		return ""
+	}
+	s := strings.Join(fields, " ")
+	if n := utf8.RuneCountInString(s); n > 200 {
+		s = string([]rune(s)[:200]) + "…"
+	}
+	return s
+}
+
+func (s *Server) toolListReleases(ctx context.Context, args map[string]any) (string, error) {
+	r, err := s.resolveReadRepo(args)
+	if err != nil {
+		return "", err
+	}
+	rels, err := s.gh.Releases(ctx, r, argInt(args, "limit", 5))
+	if err != nil {
+		return "", err
+	}
+
+	w := newBudget(s.cfg.MaxResponseBytes)
+	if len(rels) == 0 {
+		w.line(r.Slug + " 暂无 Releases，发布状态以仓库页面为准。")
+		return w.String(), nil
+	}
+	w.line(fmt.Sprintf("%s 的 Releases（最新 %d 个）：", r.Slug, len(rels)))
+	for _, rel := range rels {
+		w.line("")
+		if !w.line(fmt.Sprintf("%s（%s）", rel.Tag, rel.PublishedAt)) {
+			break
+		}
+		if rel.Name != "" && rel.Name != rel.Tag {
+			w.line("    " + truncate(rel.Name, 120))
+		}
+		if summary := releaseSummary(rel.Body); summary != "" {
+			w.line("    " + summary)
+		}
+		if rel.URL != "" {
+			w.line("    " + rel.URL)
+		}
+	}
+	return w.String(), nil
+}
+
 // ── create_issue ───────────────────────────────────────────
+
+// validateCreateArgs 校验 create_issue 的必填参数与调研字段，返回解析后的 confirmed。
+// 独立成纯函数以便单测：env 必填与 confidence 按仓库类型分支是模型误用的高频路径，
+// 必须在部署前被测试覆盖。reporter 空值也在此拒绝（杜绝「IM 用户」占位）。
+func validateCreateArgs(r *Repo, reporter, title, body, env, confidence, evidence string) (bool, error) {
+	if reporter == "" {
+		return false, fmt.Errorf("reporter 必填：报告人昵称（可附 QQ 号，格式 昵称(QQ号)），将渲染进 issue 署名；无法确定 QQ 号时只填昵称")
+	}
+	if n := utf8.RuneCountInString(title); n < issueTitleMinRunes || n > issueTitleMaxRunes {
+		return false, fmt.Errorf("title 长度需在 %d–%d 字之间，当前 %d 字", issueTitleMinRunes, issueTitleMaxRunes, n)
+	}
+	if utf8.RuneCountInString(body) < issueBodyMinRunes {
+		return false, fmt.Errorf("body 太短（不足 %d 字）：需写清用户做了什么、期望什么、实际发生什么", issueBodyMinRunes)
+	}
+	if env == "" {
+		return false, fmt.Errorf("env 必填：软件版本 / 操作系统 / 安装方式 / 问题场景，逐项填写；用户未提供的字段标「未提供」")
+	}
+	var confirmed bool
+	switch confidence {
+	case "confirmed", "yes", "true":
+		confirmed = true
+	case "unconfirmed", "no", "false":
+		confirmed = false
+	case "":
+		if r.HasCode {
+			return false, fmt.Errorf("源码仓库必填 confidence：confirmed=已在源码中定位到相关实现；unconfirmed=未能定位。反馈仓库可省略")
+		}
+		confirmed = false // 反馈仓库（无源码）默认 unconfirmed
+	default:
+		return false, fmt.Errorf("confidence 必须是 confirmed 或 unconfirmed，当前 %q", confidence)
+	}
+	if !r.HasCode {
+		// 反馈仓库（无源码）：不存在源码定位，拒绝 confirmed；evidence 不校验也不渲染。
+		if confirmed {
+			return false, fmt.Errorf("仓库 %s 为反馈仓库（无源码），不存在源码定位，请改用 confidence=unconfirmed", r.Name)
+		}
+		return confirmed, nil
+	}
+	if utf8.RuneCountInString(evidence) < issueEvidMinRunes {
+		if confirmed {
+			return false, fmt.Errorf("confidence=confirmed 时 evidence 必须给出 路径:行号 与判断依据；调研不足请先用 search_code / find_symbol 再来")
+		}
+		return false, fmt.Errorf("evidence 不能省略：至少写清查重结论（如「查重无重复」）")
+	}
+	if confirmed && !strings.Contains(evidence, ":") && !strings.Contains(evidence, "：") {
+		return false, fmt.Errorf("confidence=confirmed 但 evidence 里没有 路径:行号 形式的出处；若确实定位不到请改用 unconfirmed")
+	}
+	return confirmed, nil
+}
 
 func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (string, error) {
 	r, err := s.resolveIssueRepo(args, true)
@@ -384,30 +615,13 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 	body := strings.TrimSpace(argStr(args, "body"))
 	evidence := strings.TrimSpace(argStr(args, "evidence"))
 	confidence := strings.ToLower(strings.TrimSpace(argStr(args, "confidence")))
+	reporter := strings.TrimSpace(argStr(args, "reporter"))
+	repro := strings.TrimSpace(argStr(args, "repro"))
+	env := strings.TrimSpace(argStr(args, "env"))
 
-	if n := utf8.RuneCountInString(title); n < issueTitleMinRunes || n > issueTitleMaxRunes {
-		return "", fmt.Errorf("title 长度需在 %d–%d 字之间，当前 %d 字", issueTitleMinRunes, issueTitleMaxRunes, n)
-	}
-	if utf8.RuneCountInString(body) < issueBodyMinRunes {
-		return "", fmt.Errorf("body 太短（不足 %d 字）：需写清用户做了什么、期望什么、实际发生什么", issueBodyMinRunes)
-	}
-	var confirmed bool
-	switch confidence {
-	case "confirmed", "yes", "true":
-		confirmed = true
-	case "unconfirmed", "no", "false":
-		confirmed = false
-	default:
-		return "", fmt.Errorf("confidence 必须是 confirmed 或 unconfirmed，当前 %q", argStr(args, "confidence"))
-	}
-	if utf8.RuneCountInString(evidence) < issueEvidMinRunes {
-		if confirmed {
-			return "", fmt.Errorf("confidence=confirmed 时 evidence 必须给出 路径:行号 与判断依据；调研不足请先用 search_code / find_symbol 再来")
-		}
-		return "", fmt.Errorf("evidence 不能省略：即使未能定位，也要写明检索过哪些关键词、看过哪些文件、为什么无法确认")
-	}
-	if confirmed && !strings.Contains(evidence, ":") && !strings.Contains(evidence, "：") {
-		return "", fmt.Errorf("confidence=confirmed 但 evidence 里没有 路径:行号 形式的出处；若确实定位不到请改用 unconfirmed")
+	confirmed, err := validateCreateArgs(r, reporter, title, body, env, confidence, evidence)
+	if err != nil {
+		return "", err
 	}
 
 	// 服务端强制查重：模型自称查过不算数。
@@ -438,7 +652,7 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 	labels, dropped := s.pickLabels(ctx, r, splitList(argStr(args, "labels")))
 	draft := IssueDraft{
 		Title:  title,
-		Body:   s.renderIssueBody(r, body, evidence, confirmed, argStr(args, "repro"), argStr(args, "env"), argStr(args, "reporter")),
+		Body:   s.renderIssueBody(r, body, evidence, confirmed, reporter, repro, env),
 		Labels: labels,
 	}
 	iss, err := s.gh.Create(ctx, r, draft)
@@ -457,8 +671,8 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 	if len(dropped) > 0 {
 		w.line("已忽略仓库中不存在的标签：" + strings.Join(dropped, ", "))
 	}
-	if !confirmed {
-		w.line("已标注为「未能在源码中确认，需维护者核实」。")
+	if !r.HasCode {
+		w.line("（反馈仓库：已跳过源码查验）")
 	}
 	if rem := s.limiter.remaining(r.Name); rem >= 0 {
 		w.line(fmt.Sprintf("本小时该仓还可创建 %d 个 issue。", rem))
@@ -511,42 +725,64 @@ func (s *Server) findIssueDuplicates(ctx context.Context, r *Repo, title string)
 	return out
 }
 
-// renderIssueBody 由服务端拼装正文。模型只能填各段内容，不能控制整体结构，
-// 这样每一条机器人提交的 issue 都必然带上确定性标注与来源说明。
-func (s *Server) renderIssueBody(r *Repo, body, evidence string, confirmed bool, repro, env, reporter string) string {
+// renderIssueBody 由服务端按仓库类别拼装正文，模型只能填各段内容：
+//   - 通用段落：问题描述 + 复现 / 触发条件（repro 非空才输出）+ 环境（env 必填）
+//   - 源码仓库：再追加调研结论（确定性标注与 evidence）+ 署名（带索引 commit）
+//   - 反馈仓库（无源码）：不写调研结论段，署名标注群聊反馈
+//
+// 署名固定由服务端渲染（reporter 由模型提供），确保每条 issue 都能追溯报告人。
+// 若 body 里已自带「由聊天机器人代」署名行（模型误写），服务端不再追加，
+// 避免双署名。
+func (s *Server) renderIssueBody(r *Repo, body, evidence string, confirmed bool, reporter, repro, env string) string {
 	var b strings.Builder
+	b.WriteString("## 问题描述\n\n")
 	b.WriteString(strings.TrimSpace(body))
-	b.WriteString("\n\n## 调研结论\n\n")
-	if confirmed {
-		b.WriteString("**已在源码中定位到相关实现**\n\n")
-	} else {
-		b.WriteString("**未能在源码中确认，需维护者核实**\n\n")
-	}
-	b.WriteString(strings.TrimSpace(evidence))
 	b.WriteString("\n")
 	if v := strings.TrimSpace(repro); v != "" {
 		b.WriteString("\n## 复现 / 触发条件\n\n" + v + "\n")
 	}
-	if v := strings.TrimSpace(env); v != "" {
-		b.WriteString("\n## 环境\n\n" + v + "\n")
+	b.WriteString("\n## 环境\n\n" + strings.TrimSpace(env) + "\n")
+	if r.HasCode {
+		b.WriteString("\n## 调研结论\n\n")
+		if confirmed {
+			b.WriteString("已定位：" + strings.TrimSpace(evidence))
+		} else {
+			b.WriteString("未定位：需维护者核实")
+		}
+		b.WriteString("\n")
 	}
 
-	who := strings.TrimSpace(reporter)
-	if who == "" {
-		who = "IM 用户"
+	if strings.Contains(body, "由聊天机器人代") {
+		// body 已含署名，不再追加，防止双署名。
+		return b.String()
 	}
-	b.WriteString("\n---\n\n")
-	b.WriteString(fmt.Sprintf("由聊天机器人代 **%s** 提交", truncate(who, 60)))
-	if head := s.shortHead(r.Name); head != "" {
-		b.WriteString(fmt.Sprintf("（repoMcp，索引 commit `%s`）", head))
+	b.WriteString("\n---\n")
+	if r.HasCode {
+		b.WriteString("由聊天机器人代 " + strings.TrimSpace(reporter) + "（源码反馈，经 人机 转提交；repoMcp 索引 commit ")
+		if head := s.shortHead(r.Name); head != "" {
+			b.WriteString("`" + head + "`")
+		} else {
+			b.WriteString("-")
+		}
+		b.WriteString("）\n")
+	} else {
+		b.WriteString("由聊天机器人代 " + strings.TrimSpace(reporter) + "（群聊反馈，经 人机 转提交）\n")
 	}
-	b.WriteString("。代码定位来自自动检索，可能不完整，请以实际代码为准。\n")
 	return b.String()
 }
 
 // ── update_issue ───────────────────────────────────────────
 
 func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (string, error) {
+	reporter := strings.TrimSpace(argStr(args, "reporter"))
+	action := strings.ToLower(strings.TrimSpace(argStr(args, "action")))
+	if action == "" {
+		action = "comment"
+	}
+	// 追加评论是管理员专属操作：即使对白名单仓库，非管理员也会污染 issue 讨论。
+	if action == "comment" && !s.isAdminReporter(reporter) {
+		return "", fmt.Errorf("追加评论仅管理员可执行（adminReporters 名单）。非管理员如需补充信息，请 @管理员 处理")
+	}
 	r, err := s.resolveIssueRepo(args, true)
 	if err != nil {
 		return "", err
@@ -554,11 +790,6 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 	number := argInt(args, "number", 0)
 	if number <= 0 {
 		return "", fmt.Errorf("number 必须是正整数（issue 编号）")
-	}
-
-	action := strings.ToLower(strings.TrimSpace(argStr(args, "action")))
-	if action == "" {
-		action = "comment"
 	}
 	comment := strings.TrimSpace(argStr(args, "comment"))
 	addLabels := splitList(argStr(args, "add_labels"))
@@ -588,8 +819,18 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 			return "", fmt.Errorf("重新打开 issue 必须在 comment 里说明理由，至少 %d 字", issueNoteMinRunes)
 		}
 		edit.State = "open"
+	case "edit_title":
+		edit.Title = strings.TrimSpace(argStr(args, "title"))
+		if n := utf8.RuneCountInString(edit.Title); n < issueTitleMinRunes || n > issueTitleMaxRunes {
+			return "", fmt.Errorf("标题长度需在 %d–%d 字之间，当前 %d 字", issueTitleMinRunes, issueTitleMaxRunes, n)
+		}
+	case "edit_body":
+		edit.Body = strings.TrimSpace(argStr(args, "body"))
+		if utf8.RuneCountInString(edit.Body) < issueBodyMinRunes {
+			return "", fmt.Errorf("正文太短（不足 %d 字）：需保留用户原始报告内容", issueBodyMinRunes)
+		}
 	default:
-		return "", fmt.Errorf("未知 action %q，可选：comment / close / reopen", action)
+		return "", fmt.Errorf("未知 action %q，可选：comment / close / reopen / edit_title / edit_body", action)
 	}
 
 	// 先读当前状态：重复关闭一个已关闭的 issue 只会制造噪声通知。
@@ -618,7 +859,7 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 		}
 	}
 	iss := cur
-	if edit.State != "" || len(edit.AddLabels) > 0 || len(edit.RemoveLabels) > 0 {
+	if edit.State != "" || edit.Title != "" || edit.Body != "" || len(edit.AddLabels) > 0 || len(edit.RemoveLabels) > 0 {
 		iss, err = s.gh.Edit(ctx, r, number, edit)
 		if err != nil {
 			return "", fmt.Errorf("评论已提交，但后续修改失败：%w", err)
@@ -636,6 +877,12 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 	}
 	if comment != "" {
 		w.line("已追加评论。")
+	}
+	if edit.Title != "" {
+		w.line("已更新标题。")
+	}
+	if edit.Body != "" {
+		w.line("已更新正文。")
 	}
 	if len(edit.AddLabels) > 0 {
 		w.line("已添加标签：" + strings.Join(edit.AddLabels, ", "))

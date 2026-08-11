@@ -41,6 +41,11 @@ type Config struct {
 	// 这是防御性的：模型在对话里反复"帮你提个 issue"是真实风险，提示词约束不住。
 	MaxIssueCreatesPerHour *int `json:"maxIssueCreatesPerHour"`
 
+	// AdminReporters 是管理员报告人标识列表（昵称、QQ 号，或 昵称(QQ号) 完整格式）。
+	// 管理员对任意仓库（token 可访问的，含未配置仓库）拥有 issue 写入与修改权限；
+	// 非管理员只能对配置白名单仓库写入。列表不固定仓库，管理员要查/要改哪个仓库由对话指定。
+	AdminReporters []string `json:"adminReporters"`
+
 	Repos []RepoConfig `json:"repos"`
 
 	// 解析后的派生值。

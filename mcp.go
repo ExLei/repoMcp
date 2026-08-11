@@ -304,11 +304,20 @@ func (s *Server) instructions() string {
 4. 回答必须引用来源，格式为 路径:行号，并附检索结果给出的链接。
 5. 检索无结果时如实说明未找到，不要编造代码。
 `)
-	if len(s.issueRepos(false)) > 0 {
-		b.WriteString(`
-issue 相关要求（只对上面标注了 issue 能力的仓库有效）：
+	b.WriteString(`
+issue / PR 查询（任意公开仓库，repo 参数可用配置短名或 owner/name 如 example-owner/AstrBot）：
 6. 用户问「有没有人提过 / 这个功能什么进度」→ search_issues；要看细节与结论 → read_issue。
 7. 能靠检索代码直接回答的问题就直接回答，不要开 issue。issue 只用于缺陷、异常与功能需求。
+8. 用户问「有哪些 PR / 有人提 PR 吗 / PR 什么状态」→ search_pulls；详情 → read_pull；讨论 → list_pull_comments。
+9. 查询类工具对任意公开仓库开放；写入与修改只对配置的可写仓库（或管理员指定）有效。
+`)
+	if len(s.issueRepos(false)) > 0 {
+		b.WriteString(`10. 提交 issue 前必须两步齐全：先用 search_code / find_symbol 调研，再用 search_issues(state=all) 查重。
+   调研结论无论「已确认」还是「未能确认」都要如实写进 create_issue 的 confidence 与 evidence，不要编造出处。
+11. 一个问题只提一次。补充信息用 update_issue 追加评论，不要另开新 issue。
+12. 不要主动关闭 issue。只有用户明确要求、或问题确已解决时才 close，并写清结论。
+13. 写操作前先确认仓库对得上：把问题提到与之无关的仓库比不提更糟。
+14. 追加评论（action=comment）仅管理员（adminReporters）可执行；管理员可对任意仓库（token 可访问的）写入与修改。
 `)
 	}
 	if len(s.issueRepos(true)) > 0 {

@@ -1,7 +1,7 @@
 // tools_pulls.go：PR 查询工具（只读）。
 //
-// 与 issue 检索一样限定配置仓库，只做查询，不做任何写入——
-// PR 的写操作不在本服务能力内。
+// 与 issue 检索一样支持任意公开仓库（repo 用 owner/name），
+// 只做查询，不做任何写入——PR 的写操作不在本服务能力内。
 package main
 
 import (
@@ -25,22 +25,15 @@ func pullStateText(p PR) string {
 	return "开放中"
 }
 
-// pullToolDefs 产出 PR 查询工具。只读，依赖配置仓库的 issue 检索能力（repo 解析复用）。
+// pullToolDefs 产出 PR 查询工具。只读，不依赖配置仓库，任何部署都挂载。
 func (s *Server) pullToolDefs() []toolDef {
-	readable := s.issueRepos(false)
-	if len(readable) == 0 {
-		return nil
-	}
-	repoDesc := "仓库短名，取值：" + issueRepoList(readable)
-	if len(readable) == 1 {
-		repoDesc += "（只有一个，可省略）"
-	}
+	repoDesc := "仓库：配置短名，或任意公开仓库 owner/name（如 example-owner/AstrBot）；只有一个配置仓库时可省略"
 	return []toolDef{
 		{
 			Name:  "search_pulls",
 			Title: "检索 PR",
 			Desc: "列出仓库的 Pull Request（默认只列未合并的）。回答「有哪些 PR / 这个功能有人提 PR 吗 / PR 什么状态」。" +
-				"只读查询。每条 PR 状态直接标注：[草稿] 未就绪不可合并 / [开放中] 待审核 / [已关闭] 未合并关闭 / [已合并]。" +
+				"只读查询，支持任意公开仓库。每条 PR 状态直接标注：[草稿] 未就绪不可合并 / [开放中] 待审核 / [已关闭] 未合并关闭 / [已合并]。" +
 				"按标注如实回答状态，不要自行从 state 字段推断。",
 			Schema: obj(map[string]any{
 				"repo":  str(repoDesc),
@@ -64,7 +57,7 @@ func (s *Server) pullToolDefs() []toolDef {
 		{
 			Name:  "list_pull_comments",
 			Title: "PR 评论",
-			Desc:  "列出 PR 的讨论评论（作者/日期/内容）。只读。",
+			Desc:  "列出 PR 的讨论评论（作者/日期/内容）。只读，支持任意公开仓库。",
 			Schema: obj(map[string]any{
 				"repo":   str(repoDesc),
 				"number": integer("PR 编号（不带 #）", 1, 1000000),
@@ -78,7 +71,7 @@ func (s *Server) pullToolDefs() []toolDef {
 // ── search_pulls ───────────────────────────────────────────
 
 func (s *Server) toolSearchPulls(ctx context.Context, args map[string]any) (string, error) {
-	r, err := s.resolveIssueRepo(args, false)
+	r, err := s.resolveReadRepo(args)
 	if err != nil {
 		return "", err
 	}
@@ -129,7 +122,7 @@ func (s *Server) toolSearchPulls(ctx context.Context, args map[string]any) (stri
 // ── read_pull ──────────────────────────────────────────────
 
 func (s *Server) toolReadPull(ctx context.Context, args map[string]any) (string, error) {
-	r, err := s.resolveIssueRepo(args, false)
+	r, err := s.resolveReadRepo(args)
 	if err != nil {
 		return "", err
 	}
@@ -170,7 +163,7 @@ func (s *Server) toolReadPull(ctx context.Context, args map[string]any) (string,
 // ── list_pull_comments ─────────────────────────────────────
 
 func (s *Server) toolListPullComments(ctx context.Context, args map[string]any) (string, error) {
-	r, err := s.resolveIssueRepo(args, false)
+	r, err := s.resolveReadRepo(args)
 	if err != nil {
 		return "", err
 	}
