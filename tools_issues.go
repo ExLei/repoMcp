@@ -11,8 +11,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -193,11 +196,17 @@ func (s *Server) resolveAdminWriteRepo(args map[string]any, cands []*Repo) (*Rep
 	return nil, fmt.Errorf("未知仓库 %q：用 owner/name 形式（如 example-owner/AstrBot）或配置短名", raw)
 }
 
-// splitReporter 拆「昵称(QQ号)」为（昵称, QQ号）；无括号时纯数字视为 QQ 号。
+// splitReporter 拆「昵称(QQ号)」为（昵称, QQ号）；QQ 段剥离开头的 QQ 前缀（大小写不敏感）；
+// 无括号时纯数字视为 QQ 号。
+// 昵称可为空（如「(100000002)」，QQ 群昵称是全角空格时 AstrBot 会传出这种格式），
+// 括号内 QQ 号照样提取。
 func splitReporter(reporter string) (string, string) {
 	r := strings.TrimSpace(reporter)
-	if i := strings.LastIndex(r, "("); i > 0 && strings.HasSuffix(r, ")") {
-		return strings.TrimSpace(r[:i]), strings.TrimSpace(r[i+1 : len(r)-1])
+	if i := strings.LastIndex(r, "("); i >= 0 && strings.HasSuffix(r, ")") {
+		qq := strings.TrimSpace(r[i+1 : len(r)-1])
+		qq = strings.TrimPrefix(qq, "QQ")
+		qq = strings.TrimPrefix(qq, "qq")
+		return strings.TrimSpace(r[:i]), qq
 	}
 	if r != "" && strings.Trim(r, "0123456789") == "" {
 		return "", r
@@ -205,14 +214,15 @@ func splitReporter(reporter string) (string, string) {
 	return r, ""
 }
 
-// isAdminReporter 判断 reporter 是否命中管理员名单（昵称 / QQ 号 / 完整格式任一匹配）。
-func (s *Server) isAdminReporter(reporter string) bool {
+// adminMatch 判断 reporter 是否命中管理员名单中的任一项
+// （完整格式 / 昵称段 / QQ 号段任一匹配）。
+func adminMatch(list []string, reporter string) bool {
 	r := strings.TrimSpace(reporter)
 	if r == "" {
 		return false
 	}
 	nick, qq := splitReporter(r)
-	for _, a := range s.cfg.AdminReporters {
+	for _, a := range list {
 		a = strings.TrimSpace(a)
 		if a == "" {
 			continue
@@ -229,6 +239,42 @@ func (s *Server) isAdminReporter(reporter string) bool {
 		}
 	}
 	return false
+}
+
+// externalAdmins 读取 AstrBot cmd_config.json 的顶层 admins_id 作为管理员名单补充。
+// 按文件 mtime 缓存：配置变更后下一次调用自动生效，无需重启。
+func (s *Server) externalAdmins() []string {
+	if s.cfg == nil || s.cfg.AstrbotAdminsFile == "" {
+		return nil
+	}
+	s.adminsMu.Lock()
+	defer s.adminsMu.Unlock()
+	fi, err := os.Stat(s.cfg.AstrbotAdminsFile)
+	if err != nil {
+		return s.adminsCache // 文件暂时不可读时沿用旧值
+	}
+	if fi.ModTime() != s.adminsMtime {
+		if data, rerr := os.ReadFile(s.cfg.AstrbotAdminsFile); rerr == nil {
+			data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF}) // cmd_config.json 带 UTF-8 BOM
+			var raw struct {
+				AdminsID []string `json:"admins_id"`
+			}
+			if json.Unmarshal(data, &raw) == nil {
+				s.adminsCache = raw.AdminsID
+				s.adminsMtime = fi.ModTime()
+			}
+		}
+	}
+	return s.adminsCache
+}
+
+// isAdminReporter 判断 reporter 是否为管理员：adminReporters 名单与
+// AstrBot admins_id（astrbotAdminsFile）取并集。
+func (s *Server) isAdminReporter(reporter string) bool {
+	if adminMatch(s.cfg.AdminReporters, reporter) {
+		return true
+	}
+	return adminMatch(s.externalAdmins(), reporter)
 }
 
 // resolveReadRepo 解析只读查询的 repo 参数：

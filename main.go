@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -37,6 +38,11 @@ type Server struct {
 	index   *Index
 	gh      *GitHub
 	limiter *issueRateLimiter
+
+	// 外部管理员名单（AstrBot admins_id）缓存：mtime 变化时重读。
+	adminsMu    sync.Mutex
+	adminsCache []string
+	adminsMtime time.Time
 }
 
 func main() {

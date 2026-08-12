@@ -45,6 +45,10 @@ type Config struct {
 	// 管理员对任意仓库（token 可访问的，含未配置仓库）拥有 issue 写入与修改权限；
 	// 非管理员只能对配置白名单仓库写入。列表不固定仓库，管理员要查/要改哪个仓库由对话指定。
 	AdminReporters []string `json:"adminReporters"`
+	// AstrbotAdminsFile 是 AstrBot 的 cmd_config.json 路径（可选）。
+	// 配置后，其顶层 admins_id 数组（QQ 号 / 会话用户名）并入管理员名单，
+	// 与 adminReporters 取并集；文件变化（mtime）后自动重读，无需重启。
+	AstrbotAdminsFile string `json:"astrbotAdminsFile"`
 
 	Repos []RepoConfig `json:"repos"`
 
