@@ -49,7 +49,7 @@ func TestIsAdminReporter(t *testing.T) {
 
 func newTestSrv() *Server {
 	repos := []*Repo{
-		{Name: "pixkeep", Slug: "example-owner/PixKeep-feedback", IssueRead: true},
+		{Name: "feedback", Slug: "example-owner/ExampleFeedback", IssueRead: true},
 		{Name: "qc", Slug: "example-owner/ExampleSource", IssueRead: true, IssueWrite: true},
 	}
 	return &Server{store: NewStore(repos), cfg: &Config{GitHubToken: "tok"}}
@@ -58,8 +58,8 @@ func newTestSrv() *Server {
 func TestResolveReadRepo(t *testing.T) {
 	srv := newTestSrv()
 
-	r, err := srv.resolveReadRepo(map[string]any{"repo": "pixkeep"})
-	if err != nil || r.Slug != "example-owner/PixKeep-feedback" {
+	r, err := srv.resolveReadRepo(map[string]any{"repo": "feedback"})
+	if err != nil || r.Slug != "example-owner/ExampleFeedback" {
 		t.Fatalf("短名解析失败: %v, %v", r, err)
 	}
 

@@ -9,7 +9,7 @@ import (
 // 通用段落（问题描述 / 复现 / 环境）+ 源码仓调研结论 + 署名（防双署名）。
 func TestRenderIssueBody(t *testing.T) {
 	src := &Repo{Name: "example-source", HasCode: true}
-	fb := &Repo{Name: "pixkeep-feedback", HasCode: false}
+	fb := &Repo{Name: "example-feedback", HasCode: false}
 	srv := &Server{store: NewStore(nil)} // 无仓库：shortHead 返回空，署名回退 "-"
 
 	tests := []struct {
@@ -94,7 +94,7 @@ func TestRenderIssueBody(t *testing.T) {
 // env 必填、confidence 按仓库类型分支、evidence 校验、reporter/title/body 长度。
 func TestValidateCreateArgs(t *testing.T) {
 	src := &Repo{Name: "example-source", HasCode: true}
-	fb := &Repo{Name: "pixkeep-feedback", HasCode: false}
+	fb := &Repo{Name: "example-feedback", HasCode: false}
 	longBody := "测试正文内容需要超过二十个字才能通过长度校验要求哦"
 
 	tests := []struct {
@@ -159,5 +159,26 @@ func TestValidateCreateArgs(t *testing.T) {
 				t.Errorf("错误文案应包含 %q，实际：%v", tt.wantErrHas, err)
 			}
 		})
+	}
+}
+
+// TestIssueStateText 覆盖 issue 状态渲染：开放/已关闭/已解决/不予处理，
+// 全部中文输出，避免模型把英文 open/closed 照抄进回复。
+func TestIssueStateText(t *testing.T) {
+	cases := []struct {
+		it   Issue
+		want string
+	}{
+		{Issue{State: "open"}, "开放中"},
+		{Issue{State: "open", Reason: "reopened"}, "开放中"},
+		{Issue{State: "closed"}, "已关闭"},
+		{Issue{State: "closed", Reason: "completed"}, "closed/已解决"},
+		{Issue{State: "closed", Reason: "not_planned"}, "closed/不予处理"},
+		{Issue{State: "closed", Reason: "reopened"}, "已关闭"},
+	}
+	for _, c := range cases {
+		if got := issueStateText(c.it); got != c.want {
+			t.Errorf("issueStateText(%+v) = %q, want %q", c.it, got, c.want)
+		}
 	}
 }
