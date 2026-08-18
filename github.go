@@ -334,6 +334,127 @@ func (g *GitHub) search(ctx context.Context, r *Repo, text, state string, labels
 	return out, nil
 }
 
+// PR 是 GitHub Pull Request 的查询结果（只读）。
+type PR struct {
+	Number    int
+	Title     string
+	State     string // open / closed（已合并的 PR 状态为 closed，看 Merged）
+	Merged    bool
+	Draft     bool // 草稿 PR：未就绪、不可合并，state 仍为 open
+	Author    string
+	HeadRef   string
+	BaseRef   string
+	Comments  int
+	CreatedAt string
+	UpdatedAt string
+	URL       string
+	Body      string
+}
+
+type ghPRJSON struct {
+	Number    int       `json:"number"`
+	Title     string    `json:"title"`
+	State     string    `json:"state"`
+	Body      string    `json:"body"`
+	HTMLURL   string    `json:"html_url"`
+	Comments  int       `json:"comments"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Merged    bool      `json:"merged"`
+	Draft     bool      `json:"draft"`
+	User      struct {
+		Login string `json:"login"`
+	} `json:"user"`
+	Head struct {
+		Ref string `json:"ref"`
+	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+}
+
+func (j ghPRJSON) toPR() PR {
+	p := PR{
+		Number:   j.Number,
+		Title:    strings.TrimSpace(j.Title),
+		State:    j.State,
+		Merged:   j.Merged,
+		Draft:    j.Draft,
+		Author:   j.User.Login,
+		HeadRef:  j.Head.Ref,
+		BaseRef:  j.Base.Ref,
+		Comments: j.Comments,
+		URL:      j.HTMLURL,
+		Body:     strings.ReplaceAll(j.Body, "\r\n", "\n"),
+	}
+	if !j.CreatedAt.IsZero() {
+		p.CreatedAt = j.CreatedAt.UTC().Format("2006-01-02")
+	}
+	if !j.UpdatedAt.IsZero() {
+		p.UpdatedAt = j.UpdatedAt.UTC().Format("2006-01-02")
+	}
+	return p
+}
+
+// ListPRs 按状态列出 PR，按更新时间倒序。只读查询。
+func (g *GitHub) ListPRs(ctx context.Context, r *Repo, state string, limit int) ([]PR, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	limit = min(limit, 30)
+	v := url.Values{}
+	v.Set("state", ghNormState(state))
+	v.Set("sort", "updated")
+	v.Set("direction", "desc")
+	v.Set("per_page", strconv.Itoa(limit))
+	var raw []ghPRJSON
+	if err := g.do(ctx, r, http.MethodGet, "/repos/"+r.Slug+"/pulls?"+v.Encode(), nil, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]PR, 0, len(raw))
+	for _, j := range raw {
+		out = append(out, j.toPR())
+	}
+	return out, nil
+}
+
+// GetPR 读取单个 PR 的完整描述与状态（含合并信息）。
+func (g *GitHub) GetPR(ctx context.Context, r *Repo, number int) (PR, error) {
+	var j ghPRJSON
+	if err := g.do(ctx, r, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d", r.Slug, number), nil, &j); err != nil {
+		return PR{}, err
+	}
+	return j.toPR(), nil
+}
+
+// PRComments 返回 PR 的讨论评论（issue comments 端点），最新优先。
+// 与 issue 评论同构，复用 ghCommentJSON。
+func (g *GitHub) PRComments(ctx context.Context, r *Repo, number, limit int) ([]IssueComment, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	limit = min(limit, ghMaxComments)
+	v := url.Values{}
+	v.Set("per_page", strconv.Itoa(limit))
+	var raw []ghCommentJSON
+	if err := g.do(ctx, r, http.MethodGet, fmt.Sprintf("/repos/%s/issues/%d/comments?%s", r.Slug, number, v.Encode()), nil, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]IssueComment, 0, len(raw))
+	for _, c := range raw {
+		date := ""
+		if !c.CreatedAt.IsZero() {
+			date = c.CreatedAt.UTC().Format("2006-01-02")
+		}
+		out = append(out, IssueComment{
+			Author: c.User.Login,
+			Date:   date,
+			Body:   strings.ReplaceAll(c.Body, "\r\n", "\n"),
+		})
+	}
+	return out, nil
+}
+
 // Get 返回 issue 正文与最近若干条评论。评论取不到不影响正文返回——
 // 正文是主要证据，为了评论把整次调用判失败不划算。
 func (g *GitHub) Get(ctx context.Context, r *Repo, number int) (Issue, []IssueComment, error) {

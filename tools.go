@@ -118,7 +118,7 @@ func (s *Server) toolDefs() []toolDef {
 		},
 	}
 	// issue 工具按配置动态挂载：没接入 issue 的部署仍然只有这 5 个检索工具。
-	return append(defs, s.issueToolDefs()...)
+	return append(append(defs, s.issueToolDefs()...), s.pullToolDefs()...)
 }
 
 func (s *Server) callTool(ctx context.Context, name string, args map[string]any) (string, error) {
