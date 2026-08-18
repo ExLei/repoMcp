@@ -174,7 +174,8 @@ func (s *Server) issueToolDefs() []toolDef {
 			Title: "检索 issue",
 			Desc: "检索仓库里已有的 issue（不含 PR）。两个用途：回答「这个问题有没有人提过 / 现在有哪些待办 / 某功能什么状态」；" +
 				"以及在 create_issue 之前查重。重复提 issue 会污染仓库，提交前必须先查。" +
-				"关键词用现象里的核心名词，中英文都可以，不要把用户整句话丢进来。",
+				"关键词用现象里的核心名词，中英文都可以，不要把用户整句话丢进来。" +
+				"每条 issue 状态直接标注：[开放中] / [已关闭] / [closed/已解决] / [closed/不予处理]，按标注如实回答，不要自行推断。",
 			Schema: obj(map[string]any{
 				"query":  str("关键词，如 下载 断点续传 / aria2 timeout；省略则按更新时间列出最近的"),
 				"repo":   str(repoDesc),
@@ -709,16 +710,18 @@ func splitList(s string) []string {
 }
 
 func issueStateText(it Issue) string {
-	if it.State == "closed" {
+	switch it.State {
+	case "closed":
 		switch it.Reason {
 		case "completed":
 			return "closed/已解决"
 		case "not_planned":
 			return "closed/不予处理"
 		}
-		return "closed"
+		return "已关闭"
+	default:
+		return "开放中"
 	}
-	return it.State
 }
 
 func issueMetaLine(it Issue) string {
