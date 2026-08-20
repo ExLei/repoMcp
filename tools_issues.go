@@ -34,6 +34,10 @@ const (
 	issueBodyMinRunes  = 20
 	issueEvidMinRunes  = 2
 	issueNoteMinRunes  = 10
+
+	// sigMarker 是服务端渲染的署名哨兵，正文渲染、双署名判断与附件段定位共用，
+	// 文案调整只改这一处。
+	sigMarker = "由聊天机器人代"
 )
 
 // ── 频率限制 ────────────────────────────────────────────────
@@ -385,24 +389,7 @@ func (s *Server) issueToolDefs() []toolDef {
 				"服务端会再做一次自动查重并限制创建频率；命中疑似重复会拒绝创建并列出候选。\n" +
 				"issue 署名（由聊天机器人代 xxx 提交）由服务端统一渲染，不要在 body 参数里自行编写署名行。\n" +
 				"创建成功后把编号和链接告诉用户，同一问题不要再提第二次。",
-			Schema: obj(map[string]any{
-				"title": str("一句话标题：用户视角描述现象，不要写成「修复 xxx」。示例：多任务并发时进度条偶发不刷新"),
-				"body": str("纯文本问题描述，直接写内容：Bug 报告依次写「问题描述 → 期望行为 → 实际行为」三节；" +
-					"功能需求依次写「问题或需求 → 期望的解决方案 → 使用场景 → 优先级」；提问依次写「问题类型 → 问题描述」。" +
-					"不要添加任何 Markdown 标题或编号（段落标题由服务端渲染）；原样保留用户给出的报错文本；" +
-					"复现步骤填 repro 参数、版本系统等填 env 参数；事实性字段值必须来自用户原话，未提供的必填字段标「未提供」，禁止编造（问题场景等分类判断除外）"),
-				"confidence": str("调研结论的确定性：" +
-					"confirmed=已在源码中定位到相关实现且能给出出处；unconfirmed=没能定位，需要维护者核实。不确定就填 unconfirmed，不要硬凑。" +
-					"反馈仓库（无源码）可省略（默认 unconfirmed）"),
-				"evidence": str("调研结论（简短，仅服务端判断，不写入正文）：confirmed 写 路径:行号 及判断；" +
-					"unconfirmed 写「未定位」即可；反馈仓库无需填写。禁止写检索过程细节（关键词、看过哪些文件、为什么找不到）"),
-				"repro":                 str("复现步骤或触发条件，按用户原话组织；用户未提供时标「未提供」，非缺陷类可省略"),
-				"env":                   str("软件版本 / 操作系统 / 安装方式 / 问题场景，逐项填写；只需向用户确认软件版本，问题场景按描述推断（分类判断，非用户原话），其余用户未提供的标「未提供」"),
-				"reporter":              str("报告人：昵称，可附 QQ 号（格式：昵称(QQ号)，如 张三(QQ12345)），渲染进署名；无法确定 QQ 号时只填昵称"),
-				"labels":                str("标签，多个用逗号分隔：Bug 用 bug、功能需求用 enhancement、提问用 question；只有仓库已存在的标签会被采用，其余自动忽略"),
-				"repo":                  str(writeDesc),
-				"confirm_not_duplicate": boolean("仅在服务端查重拒绝、且你逐条读过候选确认都不是同一问题后才置 true"),
-			}, "title", "body", "env"),
+			Schema: s.createIssueSchema(writeDesc),
 			Handle: s.toolCreateIssue,
 		},
 		toolDef{
@@ -414,21 +401,59 @@ func (s *Server) issueToolDefs() []toolDef {
 				"- 不要为了「清理」而批量关闭，一次只处理一个编号；\n" +
 				"- 追加评论（action=comment）仅管理员可执行（adminReporters 名单），非管理员会被拒绝；\n" +
 				"- 不确定是否该关时，改为 comment 说明情况，把决定权留给维护者。",
-			Schema: obj(map[string]any{
-				"number":        integer("issue 编号（不带 #）", 1, 1000000),
-				"action":        str("comment（默认，仅评论）/ close（关闭）/ reopen（重新打开）/ edit_title（改标题）/ edit_body（改正文）"),
-				"comment":       str("要追加的评论。close 与 reopen 必填，需说明结论或理由"),
-				"reason":        str("关闭原因，close 时必填：completed=已解决 / not_planned=不予处理或无法复现"),
-				"title":         str("新标题，action=edit_title 时必填，长度 6–200 字"),
-				"body":          str("新正文，action=edit_body 时必填。会替换整篇正文，请保留用户原始报告内容，不足 20 字会被拒绝"),
-				"add_labels":    str("要添加的标签，逗号分隔；只有仓库已存在的标签会被采用"),
-				"remove_labels": str("要移除的标签，逗号分隔"),
-				"reporter":      str("操作者：昵称(QQ号)，如 张三(QQ12345)。追加评论（action=comment）仅管理员可执行；管理员的其他修改操作可作用于任意仓库（token 可访问的），非管理员仅限配置仓库"),
-				"repo":          str(writeDesc),
-			}, "number"),
+			Schema: s.updateIssueSchema(writeDesc),
 			Handle: s.toolUpdateIssue,
 		},
 	)
+}
+
+// createIssueSchema 构建 create_issue 的参数 schema。
+// 服务器媒体存储启用后才暴露 images 参数。
+func (s *Server) createIssueSchema(writeDesc string) map[string]any {
+	props := map[string]any{
+		"title": str("一句话标题：用户视角描述现象，不要写成「修复 xxx」。示例：多任务并发时进度条偶发不刷新"),
+		"body": str("纯文本问题描述，直接写内容：Bug 报告依次写「问题描述 → 期望行为 → 实际行为」三节；" +
+			"功能需求依次写「问题或需求 → 期望的解决方案 → 使用场景 → 优先级」；提问依次写「问题类型 → 问题描述」。" +
+			"不要添加任何 Markdown 标题或编号（段落标题由服务端渲染）；原样保留用户给出的报错文本；" +
+			"复现步骤填 repro 参数、版本系统等填 env 参数；事实性字段值必须来自用户原话，未提供的必填字段标「未提供」，禁止编造（问题场景等分类判断除外）"),
+		"confidence": str("调研结论的确定性：" +
+			"confirmed=已在源码中定位到相关实现且能给出出处；unconfirmed=没能定位，需要维护者核实。不确定就填 unconfirmed，不要硬凑。" +
+			"反馈仓库（无源码）可省略（默认 unconfirmed）"),
+		"evidence": str("调研结论（简短，仅服务端判断，不写入正文）：confirmed 写 路径:行号 及判断；" +
+			"unconfirmed 写「未定位」即可；反馈仓库无需填写。禁止写检索过程细节（关键词、看过哪些文件、为什么找不到）"),
+		"repro":                 str("复现步骤或触发条件，按用户原话组织；用户未提供时标「未提供」，非缺陷类可省略"),
+		"env":                   str("软件版本 / 操作系统 / 安装方式 / 问题场景，逐项填写；只需向用户确认软件版本，问题场景按描述推断（分类判断，非用户原话），其余用户未提供的标「未提供」"),
+		"reporter":              str("报告人：昵称，可附 QQ 号（格式：昵称(QQ号)，如 张三(QQ12345)），渲染进署名；无法确定 QQ 号时只填昵称"),
+		"labels":                str("标签，多个用逗号分隔：Bug 用 bug、功能需求用 enhancement、提问用 question；只有仓库已存在的标签会被采用，其余自动忽略"),
+		"repo":                  str(writeDesc),
+		"confirm_not_duplicate": boolean("仅在服务端查重拒绝、且你逐条读过候选确认都不是同一问题后才置 true"),
+	}
+	if s.cfg.mediaEnabled() {
+		props["images"] = str("相关截图或视频：本地路径或 URL，多个用逗号或换行分隔；最多 10 个、单个不超过 100MB。" +
+			"仅当用户提供了与问题直接相关的媒体时填写；服务端会下载并随 issue 永久保存，正文不要手写图片链接")
+	}
+	return obj(props, "title", "body", "env")
+}
+
+// updateIssueSchema 同理：images 仅对 action=edit_body 生效（随正文更新）。
+func (s *Server) updateIssueSchema(writeDesc string) map[string]any {
+	props := map[string]any{
+		"number":        integer("issue 编号（不带 #）", 1, 1000000),
+		"action":        str("comment（默认，仅评论）/ close（关闭）/ reopen（重新打开）/ edit_title（改标题）/ edit_body（改正文）"),
+		"comment":       str("要追加的评论。close 与 reopen 必填，需说明结论或理由"),
+		"reason":        str("关闭原因，close 时必填：completed=已解决 / not_planned=不予处理或无法复现"),
+		"title":         str("新标题，action=edit_title 时必填，长度 6–200 字"),
+		"body":          str("新正文，action=edit_body 时必填。会替换整篇正文，请保留用户原始报告内容，不足 20 字会被拒绝"),
+		"add_labels":    str("要添加的标签，逗号分隔；只有仓库已存在的标签会被采用"),
+		"remove_labels": str("要移除的标签，逗号分隔"),
+		"reporter":      str("操作者：昵称(QQ号)，如 张三(QQ12345)。追加评论（action=comment）仅管理员可执行；管理员的其他修改操作可作用于任意仓库（token 可访问的），非管理员仅限配置仓库"),
+		"repo":          str(writeDesc),
+	}
+	if s.cfg.mediaEnabled() {
+		props["images"] = str("要随正文更新的相关截图或视频：本地路径或 URL，多个用逗号或换行分隔；" +
+			"仅在 action=edit_body 时生效，服务端渲染进「## 附件」段")
+	}
+	return obj(props, "number")
 }
 
 // ── search_issues ──────────────────────────────────────────
@@ -696,9 +721,18 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 	}
 
 	labels, dropped := s.pickLabels(ctx, r, splitList(argStr(args, "labels")))
+	imagesList := splitList(argStr(args, "images"))
+	var media mediaResult
+	if !s.cfg.mediaEnabled() {
+		if len(imagesList) > 0 {
+			media.warnings = append(media.warnings, "images 未启用（服务器媒体存储未配置），本次未附带")
+		}
+	} else {
+		media = s.processMedia(ctx, r.Name, imagesList)
+	}
 	draft := IssueDraft{
 		Title:  title,
-		Body:   s.renderIssueBody(r, body, evidence, confirmed, reporter, repro, env),
+		Body:   s.renderIssueBody(r, body, evidence, confirmed, reporter, repro, env, media.md),
 		Labels: labels,
 	}
 	iss, err := s.gh.Create(ctx, r, draft)
@@ -717,6 +751,7 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 	if len(dropped) > 0 {
 		w.line("已忽略仓库中不存在的标签：" + strings.Join(dropped, ", "))
 	}
+	mediaReport(w, media)
 	if !r.HasCode {
 		w.line("（反馈仓库：已跳过源码查验）")
 	}
@@ -779,7 +814,7 @@ func (s *Server) findIssueDuplicates(ctx context.Context, r *Repo, title string)
 // 署名固定由服务端渲染（reporter 由模型提供），确保每条 issue 都能追溯报告人。
 // 若 body 里已自带「由聊天机器人代」署名行（模型误写），服务端不再追加，
 // 避免双署名。
-func (s *Server) renderIssueBody(r *Repo, body, evidence string, confirmed bool, reporter, repro, env string) string {
+func (s *Server) renderIssueBody(r *Repo, body, evidence string, confirmed bool, reporter, repro, env, media string) string {
 	var b strings.Builder
 	b.WriteString("## 问题描述\n\n")
 	b.WriteString(strings.TrimSpace(body))
@@ -797,14 +832,17 @@ func (s *Server) renderIssueBody(r *Repo, body, evidence string, confirmed bool,
 		}
 		b.WriteString("\n")
 	}
+	if media != "" {
+		b.WriteString("\n## 附件\n\n" + media + "\n")
+	}
 
-	if strings.Contains(body, "由聊天机器人代") {
+	if strings.Contains(body, sigMarker) {
 		// body 已含署名，不再追加，防止双署名。
 		return b.String()
 	}
 	b.WriteString("\n---\n")
 	if r.HasCode {
-		b.WriteString("由聊天机器人代 " + strings.TrimSpace(reporter) + "（源码反馈，经 人机 转提交；repoMcp 索引 commit ")
+		b.WriteString(sigMarker + " " + strings.TrimSpace(reporter) + "（源码反馈，经 人机 转提交；repoMcp 索引 commit ")
 		if head := s.shortHead(r.Name); head != "" {
 			b.WriteString("`" + head + "`")
 		} else {
@@ -812,7 +850,7 @@ func (s *Server) renderIssueBody(r *Repo, body, evidence string, confirmed bool,
 		}
 		b.WriteString("）\n")
 	} else {
-		b.WriteString("由聊天机器人代 " + strings.TrimSpace(reporter) + "（群聊反馈，经 人机 转提交）\n")
+		b.WriteString(sigMarker + " " + strings.TrimSpace(reporter) + "（群聊反馈，经 人机 转提交）\n")
 	}
 	return b.String()
 }
@@ -879,10 +917,20 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 		return "", fmt.Errorf("未知 action %q，可选：comment / close / reopen / edit_title / edit_body", action)
 	}
 
-	// 先读当前状态：重复关闭一个已关闭的 issue 只会制造噪声通知。
+	// 先读当前状态：重复关闭一个已关闭的 issue 只会制造噪声通知；
+	// 媒体保存放在存在性校验之后，避免给错误编号留下孤儿附件。
 	cur, _, err := s.gh.Get(ctx, r, number)
 	if err != nil {
 		return "", err
+	}
+	var media mediaResult
+	if action == "edit_body" {
+		media = s.processMedia(ctx, r.Name, splitList(argStr(args, "images")))
+		if media.md != "" {
+			edit.Body = insertMediaSection(edit.Body, media.md)
+		}
+	} else if len(splitList(argStr(args, "images"))) > 0 {
+		media.warnings = append(media.warnings, "images 仅在 action=edit_body 时随正文更新，本次未附带")
 	}
 	if edit.State == "closed" && cur.State == "closed" {
 		return "", fmt.Errorf("#%d 已经是关闭状态（%s），无需重复关闭。若要补充信息请用 action=comment", number, issueStateText(cur))
@@ -930,6 +978,7 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 	if edit.Body != "" {
 		w.line("已更新正文。")
 	}
+	mediaReport(w, media)
 	if len(edit.AddLabels) > 0 {
 		w.line("已添加标签：" + strings.Join(edit.AddLabels, ", "))
 	}

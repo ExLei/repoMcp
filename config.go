@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -37,6 +39,36 @@ type Config struct {
 	GitHubToken string `json:"githubToken"`
 	// GitHubTimeout 是单次 GitHub API 调用超时，Go duration，默认 20s。
 	GitHubTimeout string `json:"githubTimeout"`
+	// MediaStoreDir 是已校验媒体的服务器持久目录；MediaPublicBaseURL 是该目录
+	// 对外只读访问的 HTTPS 前缀。两者必须同时配置，留空则禁用 issue 媒体。
+	MediaStoreDir      string `json:"mediaStoreDir"`
+	MediaPublicBaseURL string `json:"mediaPublicBaseURL"`
+	// ImageDownloadHosts 是允许下载的图片 URL 域名白名单（后缀匹配，小写比较），
+	// 默认 ["qpic.cn","qq.com"]。host 不在白名单的 URL 直接拒绝：既挡 SSRF
+	// （模型可被注入诱导传任意 URL，服务端不能替它访问内网），也保证 Cookie
+	// 不会发给陌生域名。
+	ImageDownloadHosts []string `json:"imageDownloadHosts"`
+	// ImageDownloadAllowPrivate 允许白名单域名解析到私网/环回地址（默认 false）。
+	// 仅当图片源部署在内网（如 AstrBot 同机图床）时由运维显式打开；默认拒绝是
+	// SSRF 防线的核心。
+	ImageDownloadAllowPrivate bool `json:"imageDownloadAllowPrivate"`
+	// ImageDownloadCookie 下载白名单域名图片时附加的 Cookie（QQ 图片 CDN 不带 Cookie 会 403）。
+	// 只附加到 ImageDownloadHosts 匹配的 host，绝不发给其他域名。
+	ImageDownloadCookie string `json:"imageDownloadCookie"`
+	// MediaSourceDir 限制 images 本地路径的根目录：路径必须位于该目录内（相对路径按此解析）。
+	// 留空 = 不接受本地路径，只收 http(s) URL——杜绝模型被诱导读服务器任意文件。
+	MediaSourceDir string `json:"mediaSourceDir"`
+	// MediaSourcePrefix 是调用方可见、但 repoMcp 进程不可直接访问的绝对路径前缀。
+	// 配置后，该前缀下的路径按相对部分映射到 MediaSourceDir；用于容器路径到宿主机路径的转换。
+	MediaSourcePrefix string `json:"mediaSourcePrefix"`
+	// MediaTimeout 单个媒体下载/保存超时，Go duration，默认 60s。
+	MediaTimeout string `json:"mediaTimeout"`
+	// MediaTempDir 媒体下载临时目录，默认 <dataDir>/media-tmp；孤儿文件按 mediaMaxAge 定时清理。
+	MediaTempDir string `json:"mediaTempDir"`
+	// MaxMediaUploadsPerHour 限制每仓每小时的媒体保存数（含 create 与 update 路径），
+	// 默认 20，0 表示不限。独立于 issue 创建限额。
+	MaxMediaUploadsPerHour *int `json:"maxMediaUploadsPerHour"`
+
 	// MaxIssueCreatesPerHour 限制单仓每小时可创建的 issue 数，默认 5，0 表示不限。
 	// 这是防御性的：模型在对话里反复"帮你提个 issue"是真实风险，提示词约束不住。
 	MaxIssueCreatesPerHour *int `json:"maxIssueCreatesPerHour"`
@@ -53,10 +85,13 @@ type Config struct {
 	Repos []RepoConfig `json:"repos"`
 
 	// 解析后的派生值。
-	syncInterval time.Duration
-	gitTimeout   time.Duration
-	ghTimeout    time.Duration
-	issueLimit   int // 每仓每小时创建上限，0 = 不限
+	syncInterval     time.Duration
+	gitTimeout       time.Duration
+	ghTimeout        time.Duration
+	issueLimit       int // 每仓每小时创建上限，0 = 不限
+	mediaTimeout     time.Duration
+	mediaUploadLimit int // 每仓每小时媒体保存上限，0 = 不限
+	mediaPublicPath  string
 }
 
 // RepoConfig 是配置文件中的一个仓库条目。
@@ -100,6 +135,7 @@ type RepoIssuesConfig struct {
 }
 
 var reRepoName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+var reMediaPublicPath = regexp.MustCompile(`^/[A-Za-z0-9._~/-]+$`)
 
 // LoadConfig 读取配置文件并应用环境变量覆盖。
 // 环境变量：REPOMCP_CONFIG / REPOMCP_LISTEN / REPOMCP_TOKEN / REPOMCP_DATA。
@@ -162,6 +198,56 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.ghTimeout <= 0 {
 		cfg.ghTimeout = 20 * time.Second
 	}
+	cfg.mediaTimeout, err = parseDur(cfg.MediaTimeout, 60*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("mediaTimeout: %w", err)
+	}
+	if cfg.mediaTimeout <= 0 {
+		cfg.mediaTimeout = 60 * time.Second
+	}
+	cfg.MediaStoreDir = strings.TrimSpace(cfg.MediaStoreDir)
+	cfg.MediaPublicBaseURL = strings.TrimRight(strings.TrimSpace(cfg.MediaPublicBaseURL), "/")
+	if (cfg.MediaStoreDir == "") != (cfg.MediaPublicBaseURL == "") {
+		return nil, errors.New("mediaStoreDir 与 mediaPublicBaseURL 必须同时配置或同时留空")
+	}
+	if cfg.MediaPublicBaseURL != "" {
+		publicURL, err := url.Parse(cfg.MediaPublicBaseURL)
+		if err != nil || publicURL.Scheme != "https" || publicURL.Host == "" ||
+			publicURL.User != nil || publicURL.RawQuery != "" || publicURL.Fragment != "" ||
+			publicURL.Path == "" || publicURL.Path == "/" ||
+			pathpkg.Clean(publicURL.Path) != publicURL.Path ||
+			!reMediaPublicPath.MatchString(publicURL.Path) {
+			return nil, errors.New("mediaPublicBaseURL 必须是带规范非根路径、无查询参数的 HTTPS URL")
+		}
+		cfg.mediaPublicPath = publicURL.Path
+	}
+	if len(cfg.ImageDownloadHosts) == 0 {
+		cfg.ImageDownloadHosts = []string{"qpic.cn", "qq.com"}
+	}
+	for i, h := range cfg.ImageDownloadHosts {
+		cfg.ImageDownloadHosts[i] = strings.ToLower(strings.TrimSpace(h))
+	}
+	cfg.MediaSourcePrefix = strings.TrimSpace(cfg.MediaSourcePrefix)
+	if cfg.MediaSourcePrefix != "" {
+		if strings.TrimSpace(cfg.MediaSourceDir) == "" {
+			return nil, errors.New("mediaSourcePrefix 已配置但 mediaSourceDir 为空")
+		}
+		if !filepath.IsAbs(cfg.MediaSourcePrefix) {
+			return nil, errors.New("mediaSourcePrefix 必须是绝对路径")
+		}
+		cfg.MediaSourcePrefix = filepath.Clean(cfg.MediaSourcePrefix)
+	}
+	if cfg.MediaTempDir == "" {
+		cfg.MediaTempDir = filepath.Join(cfg.DataDir, "media-tmp")
+	}
+	cfg.mediaUploadLimit = 20
+	if n := cfg.MaxMediaUploadsPerHour; n != nil {
+		if *n < 0 {
+			return nil, errors.New("maxMediaUploadsPerHour 不能为负；0 表示不限")
+		}
+		cfg.mediaUploadLimit = *n
+	}
+
 	cfg.issueLimit = 5
 	if n := cfg.MaxIssueCreatesPerHour; n != nil {
 		if *n < 0 {
@@ -174,6 +260,9 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, errors.New("repos 为空：至少配置一个仓库")
 	}
 	return cfg, nil
+}
+func (c *Config) mediaEnabled() bool {
+	return c != nil && c.MediaStoreDir != "" && c.MediaPublicBaseURL != ""
 }
 
 func parseDur(s string, def time.Duration) (time.Duration, error) {

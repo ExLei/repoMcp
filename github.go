@@ -630,6 +630,44 @@ func (g *GitHub) Edit(ctx context.Context, r *Repo, number int, e IssueEdit) (Is
 	return j.toIssue(), nil
 }
 
+// MediaReferenced 判断查询词是否命中该仓库的 issue 搜索（search API 对正文全文索引）。
+// 任何错误都返回 (false, err)，由调用方 fail-safe 跳过删除。
+func (g *GitHub) MediaReferenced(ctx context.Context, repoSlug, token, query string) (bool, error) {
+	repo := &Repo{Slug: repoSlug, GHToken: token}
+	hits, err := g.search(ctx, repo, query, "all", nil, 1)
+	if err != nil {
+		return false, err
+	}
+	return len(hits) > 0, nil
+}
+
+// MediaReferencedGlobal 用全局令牌做不带 repo 限定的 issue 全文检索：
+// 引用媒体 hex 的 issue 可能在任意 token 可达仓库（含未配置仓库），只查
+// 配置仓库会漏判导致误删。任何错误都返回 (false, err)，由调用方
+// fail-safe 跳过删除。
+func (g *GitHub) MediaReferencedGlobal(ctx context.Context, token, query string) (bool, error) {
+	repo := &Repo{GHToken: token}
+	v := url.Values{}
+	v.Set("q", "is:issue "+query)
+	v.Set("per_page", "1")
+	v.Set("sort", "updated")
+	v.Set("order", "desc")
+
+	var resp struct {
+		Items []ghIssueJSON `json:"items"`
+	}
+	if err := g.do(ctx, repo, http.MethodGet, "/search/issues?"+v.Encode(), nil, &resp); err != nil {
+		return false, err
+	}
+	for _, j := range resp.Items {
+		if j.PullRequest != nil {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
 // ── 文本匹配 ────────────────────────────────────────────────
 //
 // 供两处使用：搜索接口不可用时的本地排序，以及创建前的查重。

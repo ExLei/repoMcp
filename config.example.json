@@ -6,6 +6,16 @@
   "gitTimeout": "3m",
   "maxResponseBytes": 12000,
   "githubToken": "有 issues 读写权限的 PAT；也可用环境变量 REPOMCP_GITHUB_TOKEN",
+  "mediaStoreDir": "",
+  "mediaPublicBaseURL": "",
+  "imageDownloadHosts": ["qpic.cn", "qq.com"],
+  "imageDownloadAllowPrivate": false,
+  "imageDownloadCookie": "",
+  "mediaSourceDir": "",
+  "mediaSourcePrefix": "",
+  "mediaTimeout": "60s",
+  "mediaTempDir": "",
+  "maxMediaUploadsPerHour": 20,
   "maxIssueCreatesPerHour": 5,
   "repos": [
     {

@@ -38,6 +38,8 @@ type Server struct {
 	index   *Index
 	gh      *GitHub
 	limiter *issueRateLimiter
+	// mediaLimiter 限制每仓每小时媒体保存数（独立于 issue 创建限额）。
+	mediaLimiter *issueRateLimiter
 
 	// 外部管理员名单（AstrBot admins_id）缓存：mtime 变化时重读。
 	adminsMu    sync.Mutex
@@ -64,23 +66,24 @@ func main() {
 		log.Printf("警告：未设置 token，MCP 端点无鉴权。仅应在受信网络或 127.0.0.1 上这样运行。")
 	}
 
+	if cfg.mediaEnabled() {
+		if err := os.MkdirAll(cfg.MediaStoreDir, 0o755); err != nil {
+			log.Fatalf("创建持久媒体目录失败：%v", err)
+		}
+	}
 	srv := &Server{
-		cfg:     cfg,
-		store:   NewStore(repos),
-		index:   NewIndex(),
-		gh:      NewGitHub(cfg.GitHubAPIBase, cfg.ghTimeout),
-		limiter: newIssueRateLimiter(cfg.issueLimit),
+		cfg:          cfg,
+		store:        NewStore(repos),
+		index:        NewIndex(),
+		gh:           NewGitHub(cfg.GitHubAPIBase, cfg.ghTimeout),
+		limiter:      newIssueRateLimiter(cfg.issueLimit),
+		mediaLimiter: newIssueRateLimiter(cfg.mediaUploadLimit),
 	}
 	logIssueSetup(repos, cfg)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp", srv.handleMCP)
-	mux.HandleFunc("/healthz", srv.handleHealth)
-	mux.HandleFunc("/", srv.handleRoot)
-
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           mux,
+		Handler:           srv.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		// 工具调用可能触发 git 子进程，写超时需宽于 gitTimeout。
@@ -90,6 +93,10 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if cfg.mediaEnabled() {
+		go srv.mediaSweepLoop(ctx)
+		go srv.mediaStoreSweepLoop(ctx)
+	}
 
 	go srv.syncLoop(ctx)
 
@@ -107,6 +114,18 @@ func main() {
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("关闭超时：%v", err)
 	}
+}
+
+func (s *Server) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", s.handleMCP)
+	mux.HandleFunc("/healthz", s.handleHealth)
+	if s.cfg.mediaEnabled() {
+		mux.HandleFunc(s.cfg.mediaPublicPath, s.handlePublicMedia)
+		mux.HandleFunc(s.cfg.mediaPublicPath+"/", s.handlePublicMedia)
+	}
+	mux.HandleFunc("/", s.handleRoot)
+	return mux
 }
 
 // logIssueSetup 把 issue 能力的实际生效情况打到日志。

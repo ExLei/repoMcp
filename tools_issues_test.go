@@ -21,6 +21,7 @@ func TestRenderIssueBody(t *testing.T) {
 		reporter  string
 		repro     string
 		env       string
+		media     string
 		wantHas   []string
 		wantNot   []string
 		wantOrder []string // 段落相对顺序（结构固定契约）
@@ -60,11 +61,21 @@ func TestRenderIssueBody(t *testing.T) {
 			wantHas: []string{"## 环境"},
 			wantNot: []string{"（源码反馈"},
 		},
+		{
+			name: "带附件：附件段位于署名之前",
+			r:    fb,
+			body: "工具栏消失。", evidence: "", confirmed: false,
+			reporter: "王五(QQ9)", repro: "", env: "v0.1.0 / Windows 11 / 安装包 / 截图",
+			media:     "![截图](https://astrbot.example/issue-media/a.png)",
+			wantHas:   []string{"## 附件", "![截图](https://", "群聊反馈"},
+			wantNot:   []string{"## 调研结论"},
+			wantOrder: []string{"## 环境", "## 附件"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := srv.renderIssueBody(tt.r, tt.body, tt.evidence, tt.confirmed, tt.reporter, tt.repro, tt.env)
+			got := srv.renderIssueBody(tt.r, tt.body, tt.evidence, tt.confirmed, tt.reporter, tt.repro, tt.env, tt.media)
 			for _, s := range tt.wantHas {
 				if !strings.Contains(got, s) {
 					t.Errorf("缺少 %q\n--- 实际输出 ---\n%s", s, got)
