@@ -395,12 +395,14 @@ func (s *Server) issueToolDefs() []toolDef {
 		toolDef{
 			Name:  "update_issue",
 			Title: "管理 issue",
-			Desc: "对已有 issue 追加评论、关闭、重新打开或增删标签。真实写入，规则：\n" +
-				"- 补充信息一律用 comment，不要为同一问题另开 issue；\n" +
-				"- 只有在用户明确要求，或问题确已解决/确认不做时才 close，且必须用 comment 写清结论；\n" +
-				"- 不要为了「清理」而批量关闭，一次只处理一个编号；\n" +
-				"- 追加评论（action=comment）仅管理员可执行（adminReporters 名单），非管理员会被拒绝；\n" +
-				"- 不确定是否该关时，改为 comment 说明情况，把决定权留给维护者。",
+			Desc: "对已有 issue 做补充、更正、升级、评论与状态管理。真实写入，规则：\n" +
+				"- 补充信息：issue 是本机器人代当前用户提交的（署名核得上）→ 用 action=edit_body 整篇替换正文，" +
+				"保留原文，在署名行前追加「## 补充（YYYY-MM-DD）」段；禁止用 comment 代替 edit_body；\n" +
+				"- 更正（如改优先级）与升级（[许愿]/[争议] 补全后翻转为 [Feature]/[Bug]）：先 edit_body 成功，" +
+				"再 edit_title（标题带新前缀）+add_labels 补标签；edit_body 失败则不改标题；\n" +
+				"- 署名核不上或非本机器人代提的 issue → 绝不 edit_title/edit_body；只有管理员可 comment 说明情况，把决定权留给维护者；\n" +
+				"- 只有用户明确要求、或问题确已解决/确认不做时才 close，且必须用 comment 写清结论；\n" +
+				"- 不要为了「清理」而批量关闭，一次只处理一个编号。",
 			Schema: s.updateIssueSchema(writeDesc),
 			Handle: s.toolUpdateIssue,
 		},
@@ -411,7 +413,6 @@ func (s *Server) issueToolDefs() []toolDef {
 // 服务器媒体存储启用后才暴露 images 参数。
 func (s *Server) createIssueSchema(writeDesc string) map[string]any {
 	props := map[string]any{
-		"title": str("一句话标题：用户视角描述现象，不要写成「修复 xxx」。示例：多任务并发时进度条偶发不刷新"),
 		"body": str("纯文本问题描述，直接写内容：Bug 报告依次写「问题描述 → 期望行为 → 实际行为」三节；" +
 			"功能需求依次写「问题或需求 → 期望的解决方案 → 使用场景 → 优先级」；提问依次写「问题类型 → 问题描述」。" +
 			"不要添加任何 Markdown 标题或编号（段落标题由服务端渲染）；原样保留用户给出的报错文本；" +
@@ -422,7 +423,8 @@ func (s *Server) createIssueSchema(writeDesc string) map[string]any {
 		"evidence": str("调研结论（简短，仅服务端判断，不写入正文）：confirmed 写 路径:行号 及判断；" +
 			"unconfirmed 写「未定位」即可；反馈仓库无需填写。禁止写检索过程细节（关键词、看过哪些文件、为什么找不到）"),
 		"repro":                 str("复现步骤或触发条件，按用户原话组织；用户未提供时标「未提供」，非缺陷类可省略"),
-		"env":                   str("软件版本 / 操作系统 / 安装方式 / 问题场景，逐项填写；只需向用户确认软件版本，问题场景按描述推断（分类判断，非用户原话），其余用户未提供的标「未提供」"),
+		"title":                 str("一句话标题，必须以 [Bug] / [Feature] / [Question] / [许愿] / [争议] 开头（服务端硬校验）：用户视角描述现象，不要写成「修复 xxx」。示例：[Bug] 多任务并发时进度条偶发不刷新"),
+		"env":                   str("软件版本 / 操作系统 / 安装方式 / 问题场景，逐项填写。软件版本只有用户明确给出才能填具体版本号，未提供或未确认一律填「未提供」，严禁编造版本号；问题场景按描述推断（分类判断，非用户原话），其余用户未提供的标「未提供」"),
 		"reporter":              str("报告人：昵称，可附 QQ 号（格式：昵称(QQ号)，如 张三(QQ12345)），渲染进署名；无法确定 QQ 号时只填昵称"),
 		"labels":                str("标签，多个用逗号分隔：Bug 用 bug、功能需求用 enhancement、提问用 question；只有仓库已存在的标签会被采用，其余自动忽略"),
 		"repo":                  str(writeDesc),
@@ -432,6 +434,7 @@ func (s *Server) createIssueSchema(writeDesc string) map[string]any {
 		props["images"] = str("相关截图或视频：本地路径或 URL，多个用逗号或换行分隔；最多 10 个、单个不超过 100MB。" +
 			"仅当用户提供了与问题直接相关的媒体时填写；服务端会下载并随 issue 永久保存，正文不要手写图片链接")
 	}
+
 	return obj(props, "title", "body", "env")
 }
 
@@ -637,6 +640,11 @@ func validateCreateArgs(r *Repo, reporter, title, body, env, confidence, evidenc
 	if n := utf8.RuneCountInString(title); n < issueTitleMinRunes || n > issueTitleMaxRunes {
 		return false, fmt.Errorf("title 长度需在 %d–%d 字之间，当前 %d 字", issueTitleMinRunes, issueTitleMaxRunes, n)
 	}
+	if !hasIssuePrefix(title) {
+		// 提示词约定的五种前缀（spec §9）由服务端硬校验：模型在 IM 场景
+		// 反复丢前缀，提示词约束不住，这里拦死。
+		return false, fmt.Errorf("title 必须以 [Bug] / [Feature] / [Question] / [许愿] / [争议] 开头，如「[Bug] 截图后工具栏消失」")
+	}
 	if utf8.RuneCountInString(body) < issueBodyMinRunes {
 		return false, fmt.Errorf("body 太短（不足 %d 字）：需写清用户做了什么、期望什么、实际发生什么", issueBodyMinRunes)
 	}
@@ -717,7 +725,9 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 
 	if ok, wait := s.limiter.take(r.Name); !ok {
 		return "", fmt.Errorf("未创建：%s 每小时最多创建 %d 个 issue，已达上限，约 %d 分钟后可再试。"+
-			"请先把已有 issue 的链接回复用户，或用 update_issue 在既有 issue 下补充", r.Name, s.cfg.issueLimit, int(wait.Minutes())+1)
+			"请把草稿回显到群里供用户留存：标题、正文、缺项清单三项一次性贴出，并告知可再试时间；"+
+			"不要自动重试、不要自动提醒，用户重新表达继续提交时再走一遍查重后重提",
+			r.Name, s.cfg.issueLimit, int(wait.Minutes())+1)
 	}
 
 	labels, dropped := s.pickLabels(ctx, r, splitList(argStr(args, "labels")))
@@ -763,6 +773,33 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 	return w.String(), nil
 }
 
+// issueTitlePrefixes 是提示词约定的五种标题前缀（spec §9）。
+// [许愿]/[争议] 前缀为新标题增加 token，短标题场景会稀释相似度导致漏判，
+// 查重打分前剥离（仅比较用，创建时标题保持原样）。
+var issueTitlePrefixes = []string{"[Bug]", "[Feature]", "[Question]", "[许愿]", "[争议]"}
+
+// stripIssuePrefix 剥离标题前缀并整理空白。
+func stripIssuePrefix(title string) string {
+	t := strings.TrimSpace(title)
+	for _, p := range issueTitlePrefixes {
+		if strings.HasPrefix(t, p) {
+			return strings.TrimSpace(t[len(p):])
+		}
+	}
+	return t
+}
+
+// hasIssuePrefix 判断标题是否以五种约定前缀之一开头（服务端硬校验）。
+func hasIssuePrefix(title string) bool {
+	t := strings.TrimSpace(title)
+	for _, p := range issueTitlePrefixes {
+		if strings.HasPrefix(t, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // findIssueDuplicates 双路召回后按标题相似度筛出疑似重复：
 // 搜索接口覆盖历史 issue，最近 open 列表兜底中文标题（GitHub 搜索对 CJK 分词很差）。
 // 任何一路失败都不阻断创建——查重是尽力而为，不能因为 GitHub 抖动就让用户提不了问题。
@@ -784,14 +821,14 @@ func (s *Server) findIssueDuplicates(ctx context.Context, r *Repo, title string)
 		add(items)
 	}
 
-	qt := ghTextTokens(title)
+	qt := ghTextTokens(stripIssuePrefix(title))
 	type scored struct {
 		iss   Issue
 		score float64
 	}
 	var ranked []scored
 	for _, it := range pool {
-		if sc := ghSimilarity(qt, ghTextTokens(it.Title)); sc >= issueDupThreshold {
+		if sc := ghSimilarity(qt, ghTextTokens(stripIssuePrefix(it.Title))); sc >= issueDupThreshold {
 			ranked = append(ranked, scored{it, sc})
 		}
 	}
