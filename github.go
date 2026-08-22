@@ -183,6 +183,25 @@ func (g *GitHub) do(ctx context.Context, r *Repo, method, path string, in, out a
 	return nil
 }
 
+// RepoID 返回 GitHub 仓库数据库 ID，供原生 user-attachments 上传 policy 使用。
+func (g *GitHub) RepoID(ctx context.Context, token, slug string) (int64, error) {
+	slug = strings.TrimSpace(slug)
+	if !reRepoSlug.MatchString(slug) {
+		return 0, fmt.Errorf("仓库 %q 不是合法的 owner/name", slug)
+	}
+	repo := &Repo{Slug: slug, GHToken: strings.TrimSpace(token)}
+	var payload struct {
+		ID int64 `json:"id"`
+	}
+	if err := g.do(ctx, repo, http.MethodGet, "/repos/"+slug, nil, &payload); err != nil {
+		return 0, err
+	}
+	if payload.ID <= 0 {
+		return 0, errors.New("GitHub 仓库响应缺少有效 id")
+	}
+	return payload.ID, nil
+}
+
 // ghError 把 HTTP 错误翻译成可操作的中文说明。错误文本会直接进模型上下文，
 // 因此必须指出「该改配置」还是「该换参数」，而不是只回一个状态码。
 func ghError(resp *http.Response, raw []byte, r *Repo) error {
@@ -628,44 +647,6 @@ func (g *GitHub) Edit(ctx context.Context, r *Repo, number int, e IssueEdit) (Is
 		return Issue{}, err
 	}
 	return j.toIssue(), nil
-}
-
-// MediaReferenced 判断查询词是否命中该仓库的 issue 搜索（search API 对正文全文索引）。
-// 任何错误都返回 (false, err)，由调用方 fail-safe 跳过删除。
-func (g *GitHub) MediaReferenced(ctx context.Context, repoSlug, token, query string) (bool, error) {
-	repo := &Repo{Slug: repoSlug, GHToken: token}
-	hits, err := g.search(ctx, repo, query, "all", nil, 1)
-	if err != nil {
-		return false, err
-	}
-	return len(hits) > 0, nil
-}
-
-// MediaReferencedGlobal 用全局令牌做不带 repo 限定的 issue 全文检索：
-// 引用媒体 hex 的 issue 可能在任意 token 可达仓库（含未配置仓库），只查
-// 配置仓库会漏判导致误删。任何错误都返回 (false, err)，由调用方
-// fail-safe 跳过删除。
-func (g *GitHub) MediaReferencedGlobal(ctx context.Context, token, query string) (bool, error) {
-	repo := &Repo{GHToken: token}
-	v := url.Values{}
-	v.Set("q", "is:issue "+query)
-	v.Set("per_page", "1")
-	v.Set("sort", "updated")
-	v.Set("order", "desc")
-
-	var resp struct {
-		Items []ghIssueJSON `json:"items"`
-	}
-	if err := g.do(ctx, repo, http.MethodGet, "/search/issues?"+v.Encode(), nil, &resp); err != nil {
-		return false, err
-	}
-	for _, j := range resp.Items {
-		if j.PullRequest != nil {
-			continue
-		}
-		return true, nil
-	}
-	return false, nil
 }
 
 // ── 文本匹配 ────────────────────────────────────────────────

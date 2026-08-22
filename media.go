@@ -1,8 +1,8 @@
-// media.go：issue 媒体接收、服务器持久化、公开只读访问与孤儿清扫。
+// media.go：issue 媒体接收、临时 staging 与 GitHub 原生附件渲染。
 //
 // create_issue / update_issue 的 images 参数（本地路径或 URL 列表）由服务端
-// 下载 → 类型/大小校验 → 原子写入 MediaStoreDir → 渲染 MediaPublicBaseURL
-// 链接进正文。持久目录或公开 URL 未配置时工具不暴露 images 参数。
+// 下载或受限读取 → 类型/大小校验 → 流式上传到 GitHub user-attachments。
+// repoMcp 不永久托管媒体，也不删除 AstrBot 拥有的源文件。
 //
 // 安全边界（对抗审查产物，勿弱化）：
 //   - URL 下载：host 必须命中 ImageDownloadHosts 白名单（默认 qpic.cn/qq.com），
@@ -13,19 +13,13 @@
 //   - 本地路径：必须位于 MediaSourceDir 内；MediaSourcePrefix 可将调用方可见的
 //     绝对路径映射到该目录。未配置源目录则拒绝本地路径（模型可被注入诱导，
 //     不能让服务端替它读任意文件）。错误信息不回显路径与 errno（杜绝目录存在性 oracle）。
-//   - 保存额度：每仓每小时 mediaUploadLimit 项（默认 20），独立于 issue 创建限额。
+//   - 上传额度：每仓每小时 mediaUploadLimit 项（默认 20），独立于 issue 创建限额。
 //
-// 失败语义：媒体是正文的辅助信息，单个附件失败不阻断 issue 创建——失败项
-// 以告警形式出现在工具返回里，由模型如实转告用户（视频过大按约定提示
-// 「把视频直接传给开发者」）。
+// 失败语义：媒体是正文的辅助信息，单个或全部附件失败都不阻断 issue 创建/更新；
+// 成功项保留，失败项通过工具返回明确报告。
 //
-// 临时文件：URL 下载走 <MediaTempDir> 流式落盘，保存成功/失败都立即删除；
+// 临时文件：URL 下载走 <MediaTempDir> 流式落盘，上传成功/失败都立即删除；
 // 进程崩溃遗留的下载文件由 mediaSweepLoop 按 mediaMaxAge 兜底清扫。
-//
-// 孤儿媒体：持久保存成功但 issue 创建/更新失败（或进程崩溃）时，文件留在
-// MediaStoreDir。mediaStoreSweepLoop 每天清扫：文件名符合本服务命名模式、
-// 时间戳超过 mediaOrphanGrace、且随机 hex token 未被任何 issue 仓的 search
-// 索引命中，才删除。引用核验失败时保留。
 package main
 
 import (
@@ -33,6 +27,11 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"html"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
 	"net"
@@ -40,7 +39,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -56,56 +54,75 @@ const (
 	mediaSweepInterval = time.Hour
 	// mediaMaxRedirects 是下载允许的最大重定向跳数。
 	mediaMaxRedirects = 3
-	// mediaOrphanGrace 是持久媒体的孤儿宽限期。
-	mediaOrphanGrace = 7 * 24 * time.Hour
-	// mediaStoreSweepInterval 是持久媒体孤儿清扫周期。
-	mediaStoreSweepInterval = 24 * time.Hour
 
 	mediaKindImage = "image"
 	mediaKindVideo = "video"
 )
 
-// reMediaName 匹配服务端生成的媒体文件名：UTC 时间戳 + 12 位随机 hex + 扩展名。
-// 不匹配的文件一律不公开、不清扫（fail-safe：宁可留着，绝不误删）。
-var reMediaName = regexp.MustCompile(`^(\d{8}-\d{6})-([0-9a-f]{12})\.(png|jpg|gif|webp|mp4|mov)$`)
+type attachmentUploader interface {
+	Upload(context.Context, string, int64, attachmentInput) (uploadedAttachment, error)
+}
 
-// mediaResult 是单次媒体处理的产物：md 为渲染进正文的 Markdown（可为空），
-// imageCount / videoCount 为成功附带的分类计数（spec §10 概览粒度），
-// warnings 为逐项失败原因（非致命）。
+// mediaResult 是单次媒体处理的产物。单项失败只增加 failed/warnings，
+// 已通过校验并上传成功的原生附件仍按输入顺序渲染进正文。
 type mediaResult struct {
 	md         string
+	requested  int
 	imageCount int
 	videoCount int
+	failed     int
 	warnings   []string
 }
 
-// processMedia 下载、校验并持久保存 images 列表，返回可渲染进正文的 Markdown。
-// 单项失败不阻断整体：失败原因进 warnings。保存受每仓每小时额度限制。
-func (s *Server) processMedia(ctx context.Context, repoKey string, list []string) mediaResult {
-	var res mediaResult
-	if !s.cfg.mediaEnabled() || len(list) == 0 {
+// processMedia 校验 images 列表并上传到 GitHub 原生 user-attachments。
+// 单项或全部失败都不阻断 issue 创建/更新。
+func (s *Server) processMedia(ctx context.Context, repo *Repo, list []string) mediaResult {
+	res := mediaResult{requested: len(list)}
+	if len(list) == 0 {
 		return res
 	}
 	if len(list) > mediaMaxCount {
+		dropped := len(list) - mediaMaxCount
+		res.failed += dropped
 		res.warnings = append(res.warnings,
-			fmt.Sprintf("附件超过 %d 个，仅处理前 %d 个", mediaMaxCount, mediaMaxCount))
+			fmt.Sprintf("附件超过 %d 个，后 %d 个未处理", mediaMaxCount, dropped))
 		list = list[:mediaMaxCount]
+	}
+	if s.attachmentUploader == nil {
+		res.failed += len(list)
+		res.warnings = append(res.warnings, "GitHub 原生附件凭据未配置或未认证")
+		return res
+	}
+	if repo == nil || repo.Slug == "" || s.gh == nil {
+		res.failed += len(list)
+		res.warnings = append(res.warnings, "目标仓库不可用于 GitHub 原生附件上传")
+		return res
+	}
+	repoID, err := s.gh.RepoID(ctx, repo.GHToken, repo.Slug)
+	if err != nil {
+		res.failed += len(list)
+		res.warnings = append(res.warnings, fmt.Sprintf("无法读取目标仓库信息：%v", err))
+		return res
 	}
 
 	var b strings.Builder
 	for i, item := range list {
 		item = strings.TrimSpace(item)
 		if item == "" {
+			res.failed++
+			res.warnings = append(res.warnings, fmt.Sprintf("附件 %d 为空", i+1))
 			continue
 		}
 		path, done, err := s.stageMedia(ctx, item)
 		if err != nil {
+			res.failed++
 			res.warnings = append(res.warnings, fmt.Sprintf("附件 %d 下载失败：%v", i+1, err))
 			continue
 		}
 		f, err := os.Open(path)
 		if err != nil {
 			done()
+			res.failed++
 			res.warnings = append(res.warnings, fmt.Sprintf("附件 %d 读取失败（文件不可用）", i+1))
 			continue
 		}
@@ -115,20 +132,22 @@ func (s *Server) processMedia(ctx context.Context, repoKey string, list []string
 		if err != nil {
 			_ = f.Close()
 			done()
+			res.failed++
 			res.warnings = append(res.warnings, fmt.Sprintf("附件 %d %v", i+1, err))
 			continue
 		}
 		st, err := f.Stat()
 		if err != nil {
-			// Stat 失败不得绕过大小校验：按附件失败处理。
 			_ = f.Close()
 			done()
+			res.failed++
 			res.warnings = append(res.warnings, fmt.Sprintf("附件 %d 读取失败（文件不可用）", i+1))
 			continue
 		}
 		if st.Size() > mediaMaxBytes {
 			_ = f.Close()
 			done()
+			res.failed++
 			if kind == mediaKindVideo {
 				res.warnings = append(res.warnings,
 					fmt.Sprintf("附件 %d 视频超过 100MB 无法随 issue 提交，请把视频直接传给开发者", i+1))
@@ -141,132 +160,85 @@ func (s *Server) processMedia(ctx context.Context, repoKey string, list []string
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			_ = f.Close()
 			done()
+			res.failed++
 			res.warnings = append(res.warnings, fmt.Sprintf("附件 %d 读取失败（文件不可用）", i+1))
 			continue
 		}
-		// 额度在真正持久保存前逐项扣除：校验/下载失败的项不占额度，
-		// 保存失败也照扣（宁可少传，不能让失败重试变成刷额度）。
-		if s.mediaLimiter != nil {
-			if ok, wait := s.mediaLimiter.take(repoKey); !ok {
+		width, height := 0, 0
+		if kind == mediaKindImage {
+			if imageCfg, _, decodeErr := image.DecodeConfig(f); decodeErr == nil {
+				width, height = imageCfg.Width, imageCfg.Height
+			}
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
 				_ = f.Close()
 				done()
+				res.failed++
+				res.warnings = append(res.warnings, fmt.Sprintf("附件 %d 读取失败（文件不可用）", i+1))
+				continue
+			}
+		}
+		if s.mediaLimiter != nil {
+			if ok, wait := s.mediaLimiter.take(repo.Name); !ok {
+				_ = f.Close()
+				done()
+				res.failed += len(list) - i
 				res.warnings = append(res.warnings, fmt.Sprintf(
-					"媒体保存达到每小时上限（%d 项），约 %d 分钟后可再试",
+					"媒体上传达到每小时上限（%d 项），约 %d 分钟后可再试",
 					s.cfg.mediaUploadLimit, int(wait.Minutes())+1))
 				break
 			}
 		}
-		name := mediaFileName(ext)
-		publicURL, err := s.storeMedia(name, f)
+		uploaded, err := s.attachmentUploader.Upload(ctx, repo.Slug, repoID, attachmentInput{
+			Name:        mediaFileName(ext),
+			ContentType: mediaContentType(ext),
+			Size:        st.Size(),
+			Reader:      f,
+		})
 		_ = f.Close()
 		done()
 		if err != nil {
-			log.Printf("保存 issue 附件失败：%v", err)
-			res.warnings = append(res.warnings, fmt.Sprintf("附件 %d 保存失败（服务器存储不可用）", i+1))
+			if isAttachmentAuthenticationError(err) {
+				s.attachmentStatus.markUnauthenticated()
+			}
+			res.failed++
+			res.warnings = append(res.warnings, fmt.Sprintf("附件 %d 上传失败：%v", i+1, err))
 			continue
 		}
 		if kind == mediaKindVideo {
-			b.WriteString(fmt.Sprintf("[视频（浏览器不内嵌播放，点击下载）](%s)\n", publicURL))
+			b.WriteString(uploaded.URL)
+			b.WriteByte('\n')
 			res.videoCount++
-		} else {
-			b.WriteString(fmt.Sprintf("![截图](%s)\n", publicURL))
-			res.imageCount++
+			continue
 		}
+		if width > 0 && height > 0 {
+			fmt.Fprintf(&b, `<img width="%d" height="%d" alt="Image" src="%s" />`+"\n",
+				width, height, html.EscapeString(uploaded.URL))
+		} else {
+			fmt.Fprintf(&b, `<img alt="Image" src="%s" />`+"\n", html.EscapeString(uploaded.URL))
+		}
+		res.imageCount++
 	}
 	res.md = strings.TrimSpace(b.String())
 	return res
 }
 
-// storeMedia 把已校验媒体原子写入持久目录，并返回公开 URL。临时文件与最终文件
-// 位于同一目录，rename 不会暴露半写文件。
-func (s *Server) storeMedia(name string, src io.Reader) (publicURL string, err error) {
-	tmp, err := os.CreateTemp(s.cfg.MediaStoreDir, ".media-*")
-	if err != nil {
-		return "", fmt.Errorf("创建持久媒体临时文件：%w", err)
+func mediaContentType(ext string) string {
+	switch ext {
+	case "png":
+		return "image/png"
+	case "jpg":
+		return "image/jpeg"
+	case "gif":
+		return "image/gif"
+	case "webp":
+		return "image/webp"
+	case "mp4":
+		return "video/mp4"
+	case "mov":
+		return "video/quicktime"
+	default:
+		return "application/octet-stream"
 	}
-	tmpName := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		if err != nil {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if _, err = io.Copy(tmp, src); err != nil {
-		return "", fmt.Errorf("写入持久媒体：%w", err)
-	}
-	if err = tmp.Chmod(0o644); err != nil {
-		return "", fmt.Errorf("设置持久媒体权限：%w", err)
-	}
-	if err = tmp.Sync(); err != nil {
-		return "", fmt.Errorf("同步持久媒体：%w", err)
-	}
-	if err = tmp.Close(); err != nil {
-		return "", fmt.Errorf("关闭持久媒体：%w", err)
-	}
-	finalPath := filepath.Join(s.cfg.MediaStoreDir, name)
-	if err = os.Rename(tmpName, finalPath); err != nil {
-		return "", fmt.Errorf("发布持久媒体：%w", err)
-	}
-	dir, openErr := os.Open(s.cfg.MediaStoreDir)
-	if openErr != nil {
-		return "", fmt.Errorf("打开持久媒体目录：%w", openErr)
-	}
-	syncErr := dir.Sync()
-	closeErr := dir.Close()
-	if syncErr != nil {
-		return "", fmt.Errorf("同步持久媒体目录：%w", syncErr)
-	}
-	if closeErr != nil {
-		return "", fmt.Errorf("关闭持久媒体目录：%w", closeErr)
-	}
-	return s.cfg.MediaPublicBaseURL + "/" + name, nil
-}
-
-// handlePublicMedia 只公开由本服务生成的扁平媒体文件名；不提供目录列表，
-// 不接受任意相对路径。MCP Bearer 鉴权不适用于这些供 GitHub issue 渲染的 URL。
-func (s *Server) handlePublicMedia(w http.ResponseWriter, r *http.Request) {
-	if !s.cfg.mediaEnabled() {
-		http.NotFound(w, r)
-		return
-	}
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	prefix := s.cfg.mediaPublicPath + "/"
-	if !strings.HasPrefix(r.URL.Path, prefix) {
-		http.NotFound(w, r)
-		return
-	}
-	name := strings.TrimPrefix(r.URL.Path, prefix)
-	if !reMediaName.MatchString(name) {
-		http.NotFound(w, r)
-		return
-	}
-	fullPath := filepath.Join(s.cfg.MediaStoreDir, name)
-	info, err := os.Lstat(fullPath)
-	if err != nil || !info.Mode().IsRegular() {
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Printf("读取公开 issue 媒体失败：%v", err)
-		}
-		http.NotFound(w, r)
-		return
-	}
-	f, err := os.Open(fullPath)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	defer func() { _ = f.Close() }()
-	openedInfo, err := f.Stat()
-	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	http.ServeContent(w, r, name, info.ModTime(), f)
 }
 
 // stageMedia 把单个附件落到本地文件：http(s) URL 逐跳校验下载到媒体临时目录，
@@ -494,11 +466,13 @@ func insertMediaSection(body, media string) string {
 
 // mediaReport 输出媒体处理结果播报（create 与 update 共用，避免两处漂移）。
 func mediaReport(w *budget, m mediaResult) {
-	if m.imageCount+m.videoCount > 0 {
-		w.line(fmt.Sprintf("已附带截图 %d 张/视频 %d 个。", m.imageCount, m.videoCount))
+	if m.requested == 0 {
+		return
 	}
+	success := m.imageCount + m.videoCount
+	w.line(fmt.Sprintf("请求附件 %d 个：成功 %d 个，失败 %d 个。", m.requested, success, m.failed))
 	for _, warn := range m.warnings {
-		w.line("未能附带：" + warn)
+		w.line("附件缺失：" + warn)
 	}
 }
 
@@ -546,92 +520,6 @@ func (s *Server) mediaSweepLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			sweep()
-		}
-	}
-}
-
-// sweepOrphanMedia 清扫服务器持久目录中超过宽限期且无 issue 引用的媒体。
-// 判定引用 = 文件名里的随机 hex token 出现在任一 issue 仓的 search 结果。
-// 不匹配命名不动、宽限期内不动、引用核验失败不动。
-func (s *Server) sweepOrphanMedia(ctx context.Context) {
-	if !s.cfg.mediaEnabled() {
-		return
-	}
-	entries, err := os.ReadDir(s.cfg.MediaStoreDir)
-	if err != nil {
-		log.Printf("媒体孤儿清扫跳过（读取目录失败）：%v", err)
-		return
-	}
-	repos := s.issueRepos(false)
-	if len(repos) == 0 {
-		return
-	}
-	cutoff := time.Now().Add(-mediaOrphanGrace)
-	for _, entry := range entries {
-		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() {
-			continue
-		}
-		name := entry.Name()
-		m := reMediaName.FindStringSubmatch(name)
-		if m == nil {
-			continue
-		}
-		ts, err := time.ParseInLocation("20060102-150405", m[1], time.UTC)
-		if err != nil || ts.After(cutoff) {
-			continue
-		}
-		ref, err := s.mediaReferenced(ctx, repos, m[2])
-		if err != nil {
-			log.Printf("媒体孤儿清扫：%s 引用核验失败（跳过）：%v", name, err)
-			continue
-		}
-		if ref {
-			continue
-		}
-		if err := os.Remove(filepath.Join(s.cfg.MediaStoreDir, name)); err != nil {
-			log.Printf("媒体孤儿清扫：删除 %s 失败：%v", name, err)
-			continue
-		}
-		log.Printf("清理孤儿媒体 %s（无人引用且超过 %d 天）", name, int(mediaOrphanGrace.Hours()/24))
-	}
-}
-
-// mediaReferenced 核验 hex token 是否被任何 issue 引用。有全局令牌时先做全局
-// 检索（覆盖未配置仓库里的引用），再逐仓核对；任一必需查询失败都返回错误。
-func (s *Server) mediaReferenced(ctx context.Context, repos []*Repo, hexToken string) (bool, error) {
-	if s.cfg.GitHubToken != "" {
-		hit, err := s.gh.MediaReferencedGlobal(ctx, s.cfg.GitHubToken, hexToken)
-		if err != nil {
-			return false, err
-		}
-		if hit {
-			return true, nil
-		}
-	}
-	for _, r := range repos {
-		hit, err := s.gh.MediaReferenced(ctx, r.Slug, r.GHToken, hexToken)
-		if err != nil {
-			return false, err
-		}
-		if hit {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// mediaStoreSweepLoop 启动即清扫一次，之后每天兜底；随服务生命周期退出。
-func (s *Server) mediaStoreSweepLoop(ctx context.Context) {
-	s.sweepOrphanMedia(ctx)
-	t := time.NewTicker(mediaStoreSweepInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.sweepOrphanMedia(ctx)
 		}
 	}
 }

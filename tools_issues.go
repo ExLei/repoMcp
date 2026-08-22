@@ -409,8 +409,8 @@ func (s *Server) issueToolDefs() []toolDef {
 	)
 }
 
-// createIssueSchema 构建 create_issue 的参数 schema。
-// 服务器媒体存储启用后才暴露 images 参数。
+// createIssueSchema 构建 create_issue 的参数 schema。images 始终暴露；
+// 原生附件凭据不可用时 issue 仍会创建，并在工具返回中报告附件缺失。
 func (s *Server) createIssueSchema(writeDesc string) map[string]any {
 	props := map[string]any{
 		"body": str("纯文本问题描述，直接写内容：Bug 报告依次写「问题描述 → 期望行为 → 实际行为」三节；" +
@@ -429,16 +429,13 @@ func (s *Server) createIssueSchema(writeDesc string) map[string]any {
 		"labels":                str("标签，多个用逗号分隔：Bug 用 bug、功能需求用 enhancement、提问用 question；只有仓库已存在的标签会被采用，其余自动忽略"),
 		"repo":                  str(writeDesc),
 		"confirm_not_duplicate": boolean("仅在服务端查重拒绝、且你逐条读过候选确认都不是同一问题后才置 true"),
+		"images": str("相关截图或视频：本地路径或 URL，多个用逗号或换行分隔；最多 10 个、单个不超过 100MB。" +
+			"服务端尝试上传为 GitHub 原生附件；上传失败不阻止 issue 创建，但会明确报告缺失"),
 	}
-	if s.cfg.mediaEnabled() {
-		props["images"] = str("相关截图或视频：本地路径或 URL，多个用逗号或换行分隔；最多 10 个、单个不超过 100MB。" +
-			"仅当用户提供了与问题直接相关的媒体时填写；服务端会下载并随 issue 永久保存，正文不要手写图片链接")
-	}
-
 	return obj(props, "title", "body", "env")
 }
 
-// updateIssueSchema 同理：images 仅对 action=edit_body 生效（随正文更新）。
+// updateIssueSchema 的 images 仅对 action=edit_body 生效。
 func (s *Server) updateIssueSchema(writeDesc string) map[string]any {
 	props := map[string]any{
 		"number":        integer("issue 编号（不带 #）", 1, 1000000),
@@ -451,10 +448,8 @@ func (s *Server) updateIssueSchema(writeDesc string) map[string]any {
 		"remove_labels": str("要移除的标签，逗号分隔"),
 		"reporter":      str("操作者：昵称(QQ号)，如 张三(QQ12345)。追加评论（action=comment）仅管理员可执行；管理员的其他修改操作可作用于任意仓库（token 可访问的），非管理员仅限配置仓库"),
 		"repo":          str(writeDesc),
-	}
-	if s.cfg.mediaEnabled() {
-		props["images"] = str("要随正文更新的相关截图或视频：本地路径或 URL，多个用逗号或换行分隔；" +
-			"仅在 action=edit_body 时生效，服务端渲染进「## 附件」段")
+		"images": str("要随正文更新的相关截图或视频：本地路径或 URL，多个用逗号或换行分隔；" +
+			"仅在 action=edit_body 时生效；上传失败不阻止正文更新，但会明确报告缺失"),
 	}
 	return obj(props, "number")
 }
@@ -732,14 +727,7 @@ func (s *Server) toolCreateIssue(ctx context.Context, args map[string]any) (stri
 
 	labels, dropped := s.pickLabels(ctx, r, splitList(argStr(args, "labels")))
 	imagesList := splitList(argStr(args, "images"))
-	var media mediaResult
-	if !s.cfg.mediaEnabled() {
-		if len(imagesList) > 0 {
-			media.warnings = append(media.warnings, "images 未启用（服务器媒体存储未配置），本次未附带")
-		}
-	} else {
-		media = s.processMedia(ctx, r.Name, imagesList)
-	}
+	media := s.processMedia(ctx, r, imagesList)
 	draft := IssueDraft{
 		Title:  title,
 		Body:   s.renderIssueBody(r, body, evidence, confirmed, reporter, repro, env, media.md),
@@ -962,11 +950,13 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 	}
 	var media mediaResult
 	if action == "edit_body" {
-		media = s.processMedia(ctx, r.Name, splitList(argStr(args, "images")))
+		media = s.processMedia(ctx, r, splitList(argStr(args, "images")))
 		if media.md != "" {
 			edit.Body = insertMediaSection(edit.Body, media.md)
 		}
-	} else if len(splitList(argStr(args, "images"))) > 0 {
+	} else if images := splitList(argStr(args, "images")); len(images) > 0 {
+		media.requested = len(images)
+		media.failed = len(images)
 		media.warnings = append(media.warnings, "images 仅在 action=edit_body 时随正文更新，本次未附带")
 	}
 	if edit.State == "closed" && cur.State == "closed" {

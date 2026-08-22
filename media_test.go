@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"image"
+	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +20,8 @@ import (
 // pngBytes 是足以通过 http.DetectContentType 嗅探的最小 PNG 魔数。
 var pngBytes = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 0}
 
+var mediaTestRepo = &Repo{Name: "repo", Slug: "example-owner/ExampleSource", GHToken: "token"}
+
 // mp4Bytes 是 Go 嗅探器认可的 mp4 魔数（box 锚定在偏移 4：ftyp 盒 + isom brand），
 // 测试超大视频时只用头部 + 补零，不必真的构造 100MB 有效视频。
 func mp4Bytes(size int) []byte {
@@ -26,24 +32,32 @@ func mp4Bytes(size int) []byte {
 
 func newMediaTestServer(t *testing.T) *Server {
 	t.Helper()
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource" {
+			_, _ = w.Write([]byte(`{"id":1026542182}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(github.Close)
 	return &Server{
 		cfg: &Config{
-			MediaStoreDir:             t.TempDir(),
-			MediaPublicBaseURL:        "https://astrbot.example/issue-media",
-			mediaPublicPath:           "/issue-media",
 			MediaTempDir:              t.TempDir(),
 			ImageDownloadHosts:        []string{"127.0.0.1"},
 			ImageDownloadAllowPrivate: true,
 			MediaSourceDir:            t.TempDir(),
+			mediaTimeout:              10 * time.Second,
 			mediaUploadLimit:          100,
 		},
-		mediaLimiter: newIssueRateLimiter(100),
+		gh:                 NewGitHub(github.URL, 10*time.Second),
+		mediaLimiter:       newIssueRateLimiter(100),
+		attachmentUploader: &fakeAttachmentUploader{},
 	}
 }
 
-func storedMediaEntries(t *testing.T, s *Server) []os.DirEntry {
+func mediaTempEntries(t *testing.T, s *Server) []os.DirEntry {
 	t.Helper()
-	entries, err := os.ReadDir(s.cfg.MediaStoreDir)
+	entries, err := os.ReadDir(s.cfg.MediaTempDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,28 +75,21 @@ func TestProcessMediaImageURL(t *testing.T) {
 	defer img.Close()
 	s.cfg.ImageDownloadCookie = "ck=1"
 
-	res := s.processMedia(context.Background(), "repo", []string{img.URL})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{img.URL})
 	if res.imageCount != 1 {
 		t.Fatalf("应附带 1 张截图，实际 %d，告警：%v", res.imageCount, res.warnings)
 	}
 	if len(res.warnings) != 0 {
 		t.Errorf("不应有告警：%v", res.warnings)
 	}
-	entries := storedMediaEntries(t, s)
-	if len(entries) != 1 {
-		t.Fatalf("应保存 1 个媒体文件，实际 %d", len(entries))
+	uploader := s.attachmentUploader.(*fakeAttachmentUploader)
+	if len(uploader.uploads) != 1 || !bytes.Equal(uploader.uploads[0].Bytes, pngBytes) {
+		t.Fatalf("原生附件上传内容错误：%+v", uploader.uploads)
 	}
-	if want := "![截图](" + s.cfg.MediaPublicBaseURL + "/" + entries[0].Name() + ")"; res.md != want {
-		t.Errorf("渲染链接：got %q want %q", res.md, want)
+	if !strings.Contains(res.md, "https://github.com/user-attachments/assets/") {
+		t.Errorf("正文应引用 GitHub 原生附件：%q", res.md)
 	}
-	stored, err := os.ReadFile(filepath.Join(s.cfg.MediaStoreDir, entries[0].Name()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(stored, pngBytes) {
-		t.Error("持久文件内容应等于下载的图片")
-	}
-	if entries := storedMediaEntries(t, &Server{cfg: &Config{MediaStoreDir: s.cfg.MediaTempDir}}); len(entries) != 0 {
+	if entries := mediaTempEntries(t, s); len(entries) != 0 {
 		t.Errorf("下载临时文件应已清理，剩余 %d 个", len(entries))
 	}
 }
@@ -94,183 +101,16 @@ func TestProcessMediaLocalPath(t *testing.T) {
 	if err := os.WriteFile(path, pngBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res := s.processMedia(context.Background(), "repo", []string{path})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{path})
 	if res.imageCount != 1 || len(res.warnings) != 0 {
 		t.Fatalf("本地路径应成功附带，imageCount=%d warnings=%v", res.imageCount, res.warnings)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("本地原文件不应被删：%v", err)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 1 {
-		t.Errorf("应保存 1 个媒体文件，实际 %d", got)
-	}
-}
-
-func loadServerMediaConfig(t *testing.T, sourceDir, storeDir string) *Config {
-	t.Helper()
-	configPath := filepath.Join(t.TempDir(), "config.json")
-	raw, err := json.Marshal(map[string]any{
-		"dataDir":            t.TempDir(),
-		"mediaSourceDir":     sourceDir,
-		"mediaStoreDir":      storeDir,
-		"mediaPublicBaseURL": "https://astrbot.example/issue-media",
-		"repos": []map[string]any{{
-			"name": "repo",
-			"url":  "https://github.com/example-owner/test.git",
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := LoadConfig(configPath)
-	if err != nil {
-		t.Fatalf("本地媒体存储配置应有效：%v", err)
-	}
-	return cfg
-}
-
-func TestLoadConfigRejectsUnsafeMediaPublicPath(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.json")
-	raw, err := json.Marshal(map[string]any{
-		"mediaStoreDir":      t.TempDir(),
-		"mediaPublicBaseURL": "https://astrbot.example/issue-media/%7B",
-		"repos": []map[string]any{{
-			"name": "repo",
-			"url":  "https://github.com/example-owner/test.git",
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := LoadConfig(configPath); err == nil {
-		t.Fatal("包含 ServeMux 模式字符的 mediaPublicBaseURL 应被拒绝")
-	}
-}
-
-func TestProcessMediaStoresOnServer(t *testing.T) {
-	sourceDir := t.TempDir()
-	storeDir := t.TempDir()
-	cfg := loadServerMediaConfig(t, sourceDir, storeDir)
-	s := &Server{
-		cfg:          cfg,
-		mediaLimiter: newIssueRateLimiter(100),
-	}
-	sourcePath := filepath.Join(sourceDir, "capture.png")
-	if err := os.WriteFile(sourcePath, pngBytes, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	res := s.processMedia(context.Background(), "repo", []string{sourcePath})
-	if res.imageCount != 1 || len(res.warnings) != 0 {
-		t.Fatalf("图片应保存到服务器，imageCount=%d warnings=%v", res.imageCount, res.warnings)
-	}
-	entries, err := os.ReadDir(storeDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("媒体目录应只有 1 个文件，实际 %d", len(entries))
-	}
-	storedPath := filepath.Join(storeDir, entries[0].Name())
-	stored, err := os.ReadFile(storedPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(stored, pngBytes) {
-		t.Error("服务器文件内容应等于原始图片")
-	}
-	if want := "![截图](https://astrbot.example/issue-media/" + entries[0].Name() + ")"; res.md != want {
-		t.Errorf("正文应引用服务器 URL：got %q want %q", res.md, want)
-	}
-	if info, err := os.Stat(storedPath); err != nil {
-		t.Fatal(err)
-	} else if info.Mode().Perm() != 0o644 {
-		t.Errorf("持久媒体权限应为 0644，实际 %04o", info.Mode().Perm())
-	}
-}
-
-func TestHandlePublicMediaContract(t *testing.T) {
-	storeDir := t.TempDir()
-	name := "20260822-010203-abcdef123456.png"
-	if err := os.WriteFile(filepath.Join(storeDir, name), pngBytes, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	linkName := "20260822-010204-abcdef123457.png"
-	outside := filepath.Join(t.TempDir(), "secret.png")
-	if err := os.WriteFile(outside, pngBytes, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(storeDir, linkName)); err != nil {
-		t.Skipf("环境不支持符号链接：%v", err)
-	}
-	s := &Server{cfg: loadServerMediaConfig(t, t.TempDir(), storeDir)}
-	tests := []struct {
-		name      string
-		method    string
-		path      string
-		status    int
-		wantBody  bool
-		wantEmpty bool
-		wantAllow string
-	}{
-		{name: "get", method: http.MethodGet, path: "/issue-media/" + name, status: http.StatusOK, wantBody: true},
-		{name: "head", method: http.MethodHead, path: "/issue-media/" + name, status: http.StatusOK, wantEmpty: true},
-		{name: "listing", method: http.MethodGet, path: "/issue-media/", status: http.StatusNotFound},
-		{name: "traversal", method: http.MethodGet, path: "/issue-media/../secret.png", status: http.StatusNotFound},
-		{name: "symlink", method: http.MethodGet, path: "/issue-media/" + linkName, status: http.StatusNotFound},
-		{name: "post", method: http.MethodPost, path: "/issue-media/" + name, status: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			s.handlePublicMedia(rec, httptest.NewRequest(tt.method, tt.path, nil))
-			if rec.Code != tt.status {
-				t.Fatalf("status=%d want=%d body=%q", rec.Code, tt.status, rec.Body.String())
-			}
-			if tt.wantBody && !bytes.Equal(rec.Body.Bytes(), pngBytes) {
-				t.Error("GET 应返回原始图片")
-			}
-			if tt.wantEmpty && rec.Body.Len() != 0 {
-				t.Errorf("HEAD 响应体应为空，实际 %d 字节", rec.Body.Len())
-			}
-			if got := rec.Header().Get("Allow"); got != tt.wantAllow {
-				t.Errorf("Allow=%q want=%q", got, tt.wantAllow)
-			}
-			if tt.status == http.StatusOK {
-				if got := rec.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
-					t.Errorf("Cache-Control=%q", got)
-				}
-			}
-		})
-	}
-}
-
-func TestServerHandlerBareMediaPrefix(t *testing.T) {
-	s := &Server{cfg: loadServerMediaConfig(t, t.TempDir(), t.TempDir())}
-	handler := s.handler()
-	tests := []struct {
-		method    string
-		status    int
-		wantAllow string
-	}{
-		{method: http.MethodGet, status: http.StatusNotFound},
-		{method: http.MethodPost, status: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
-	}
-	for _, tt := range tests {
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, httptest.NewRequest(tt.method, "/issue-media", nil))
-		if rec.Code != tt.status {
-			t.Errorf("%s status=%d want=%d", tt.method, rec.Code, tt.status)
-		}
-		if got := rec.Header().Get("Allow"); got != tt.wantAllow {
-			t.Errorf("%s Allow=%q want=%q", tt.method, got, tt.wantAllow)
-		}
+	uploader := s.attachmentUploader.(*fakeAttachmentUploader)
+	if len(uploader.uploads) != 1 || !bytes.Equal(uploader.uploads[0].Bytes, pngBytes) {
+		t.Fatalf("本地文件未正确上传：%+v", uploader.uploads)
 	}
 }
 
@@ -281,15 +121,15 @@ func TestProcessMediaOversizedVideo(t *testing.T) {
 	if err := os.WriteFile(path, mp4Bytes(mediaMaxBytes+1), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res := s.processMedia(context.Background(), "repo", []string{path})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{path})
 	if res.imageCount+res.videoCount != 0 {
 		t.Errorf("超大视频不应附带，imageCount=%d videoCount=%d", res.imageCount, res.videoCount)
 	}
 	if len(res.warnings) != 1 || !strings.Contains(res.warnings[0], "传给开发者") {
 		t.Errorf("超大视频应提示传开发者，实际告警：%v", res.warnings)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 0 {
-		t.Errorf("超限媒体不应落盘，实际 %d 个", got)
+	if got := len(mediaTempEntries(t, s)); got != 0 {
+		t.Errorf("超限媒体不应遗留临时文件，实际 %d 个", got)
 	}
 }
 
@@ -299,12 +139,12 @@ func TestProcessMediaUnsupportedType(t *testing.T) {
 		_, _ = w.Write([]byte("just some text"))
 	}))
 	defer srv.Close()
-	res := s.processMedia(context.Background(), "repo", []string{srv.URL})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{srv.URL})
 	if len(res.warnings) != 1 || !strings.Contains(res.warnings[0], "类型不支持") {
 		t.Errorf("应提示类型不支持，实际：%v", res.warnings)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 0 {
-		t.Errorf("非法媒体不应落盘，实际 %d 个", got)
+	if got := len(mediaTempEntries(t, s)); got != 0 {
+		t.Errorf("非法媒体不应遗留临时文件，实际 %d 个", got)
 	}
 }
 
@@ -314,7 +154,7 @@ func TestProcessMediaDownload403(t *testing.T) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 	}))
 	defer srv.Close()
-	res := s.processMedia(context.Background(), "repo", []string{srv.URL})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{srv.URL})
 	if len(res.warnings) != 1 || !strings.Contains(res.warnings[0], "Cookie") {
 		t.Errorf("403 应提示 Cookie 配置，实际：%v", res.warnings)
 	}
@@ -332,11 +172,12 @@ func TestInsertMediaSectionSeparator(t *testing.T) {
 	}
 }
 
-func TestProcessMediaNoStore(t *testing.T) {
+func TestProcessMediaWithoutUploaderReportsFailure(t *testing.T) {
 	s := &Server{cfg: &Config{}}
-	res := s.processMedia(context.Background(), "repo", []string{"whatever"})
-	if res.md != "" || res.imageCount != 0 || res.videoCount != 0 {
-		t.Errorf("未配置服务器媒体存储时应完全跳过，实际 %+v", res)
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{"whatever"})
+	if res.requested != 1 || res.failed != 1 || res.md != "" ||
+		len(res.warnings) != 1 || !strings.Contains(res.warnings[0], "凭据") {
+		t.Errorf("未配置附件上传器时应报告失败且不阻塞，实际 %+v", res)
 	}
 }
 
@@ -354,12 +195,12 @@ func TestProcessMediaHostNotWhitelisted(t *testing.T) {
 	}))
 	defer img.Close()
 
-	res := s.processMedia(context.Background(), "repo", []string{img.URL})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{img.URL})
 	if len(res.warnings) != 1 || !strings.Contains(res.warnings[0], "白名单") {
 		t.Errorf("应提示白名单拒绝，实际：%v", res.warnings)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 0 {
-		t.Errorf("被拒图片不应落盘，实际 %d 个", got)
+	if got := len(mediaTempEntries(t, s)); got != 0 {
+		t.Errorf("被拒图片不应遗留临时文件，实际 %d 个", got)
 	}
 }
 
@@ -370,19 +211,19 @@ func TestProcessMediaLocalOutsideDir(t *testing.T) {
 	if err := os.WriteFile(outside, pngBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res := s.processMedia(context.Background(), "repo", []string{outside})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{outside})
 	if len(res.warnings) != 1 || !strings.Contains(res.warnings[0], "不可用") {
 		t.Errorf("目录外路径应拒绝，实际：%v", res.warnings)
 	}
 	if strings.Contains(res.warnings[0], outside) {
 		t.Errorf("告警不应回显路径：%v", res.warnings)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 0 {
-		t.Errorf("目录外图片不应落盘，实际 %d 个", got)
+	if got := len(mediaTempEntries(t, s)); got != 0 {
+		t.Errorf("目录外图片不应遗留临时文件，实际 %d 个", got)
 	}
 }
 
-// TestProcessMediaUploadLimit 覆盖媒体保存独立限额：额度耗尽后拒绝且不下载。
+// TestProcessMediaUploadLimit 覆盖附件上传独立限额：额度耗尽后拒绝且不下载。
 func TestProcessMediaUploadLimit(t *testing.T) {
 	s := newMediaTestServer(t)
 	s.mediaLimiter = newIssueRateLimiter(1)
@@ -391,16 +232,16 @@ func TestProcessMediaUploadLimit(t *testing.T) {
 	}))
 	defer img.Close()
 
-	first := s.processMedia(context.Background(), "repo", []string{img.URL})
+	first := s.processMedia(context.Background(), mediaTestRepo, []string{img.URL})
 	if first.imageCount != 1 {
 		t.Fatalf("首次应成功，imageCount=%d warnings=%v", first.imageCount, first.warnings)
 	}
-	second := s.processMedia(context.Background(), "repo", []string{img.URL})
+	second := s.processMedia(context.Background(), mediaTestRepo, []string{img.URL})
 	if second.imageCount != 0 || len(second.warnings) != 1 || !strings.Contains(second.warnings[0], "上限") {
 		t.Errorf("第二次应被限额拒绝，实际 imageCount=%d warnings=%v", second.imageCount, second.warnings)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 1 {
-		t.Errorf("应只保存 1 个媒体文件，实际 %d 个", got)
+	if got := len(s.attachmentUploader.(*fakeAttachmentUploader).uploads); got != 1 {
+		t.Errorf("应只上传 1 个媒体文件，实际 %d 个", got)
 	}
 }
 
@@ -417,72 +258,6 @@ func TestInsertMediaSection(t *testing.T) {
 	got = insertMediaSection(noSig, "![截图](https://x/b.png)")
 	if !strings.HasSuffix(got, "## 附件\n\n![截图](https://x/b.png)\n") {
 		t.Errorf("无署名时应追加文末：%s", got)
-	}
-}
-
-// TestSweepOrphanMedia 覆盖服务器孤儿媒体清扫：旧孤儿删除、被引用保留、
-// 新文件保留、非本服务命名不动。
-func TestSweepOrphanMedia(t *testing.T) {
-	storeDir := t.TempDir()
-	oldStamp := time.Now().UTC().Add(-8 * 24 * time.Hour).Format("20060102-150405")
-	freshStamp := time.Now().UTC().Format("20060102-150405")
-	orphan := oldStamp + "-deadbeef0001.png"
-	referenced := oldStamp + "-deadbeef0002.png"
-	fresh := freshStamp + "-deadbeef0003.png"
-	for _, name := range []string{orphan, referenced, fresh, "README.md"} {
-		if err := os.WriteFile(filepath.Join(storeDir, name), pngBytes, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/search/issues") {
-			http.NotFound(w, r)
-			return
-		}
-		if strings.Contains(r.URL.Query().Get("q"), "deadbeef0002") {
-			_, _ = w.Write([]byte(`{"total_count":1,"items":[{"number":1,"title":"x","state":"open"}]}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
-	}))
-	t.Cleanup(srv.Close)
-	s := &Server{
-		cfg:   &Config{MediaStoreDir: storeDir, MediaPublicBaseURL: "https://astrbot.example/issue-media", mediaTimeout: 10 * time.Second},
-		gh:    NewGitHub(srv.URL, 10*time.Second),
-		store: NewStore([]*Repo{{Name: "fb", Slug: "example-owner/ExampleFeedback", IssueRead: true, GHToken: "t"}}),
-	}
-
-	s.sweepOrphanMedia(context.Background())
-	if _, err := os.Stat(filepath.Join(storeDir, orphan)); !os.IsNotExist(err) {
-		t.Error("超过宽限期且无人引用的媒体应删除")
-	}
-	for _, name := range []string{referenced, fresh, "README.md"} {
-		if _, err := os.Stat(filepath.Join(storeDir, name)); err != nil {
-			t.Errorf("%s 应保留：%v", name, err)
-		}
-	}
-}
-
-func TestSweepOrphanMediaSearchError(t *testing.T) {
-	storeDir := t.TempDir()
-	oldStamp := time.Now().UTC().Add(-8 * 24 * time.Hour).Format("20060102-150405")
-	name := oldStamp + "-deadbeef0001.png"
-	if err := os.WriteFile(filepath.Join(storeDir, name), pngBytes, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	t.Cleanup(srv.Close)
-	s := &Server{
-		cfg:   &Config{MediaStoreDir: storeDir, MediaPublicBaseURL: "https://astrbot.example/issue-media", mediaTimeout: 10 * time.Second},
-		gh:    NewGitHub(srv.URL, 10*time.Second),
-		store: NewStore([]*Repo{{Name: "fb", Slug: "example-owner/ExampleFeedback", IssueRead: true, GHToken: "t"}}),
-	}
-
-	s.sweepOrphanMedia(context.Background())
-	if _, err := os.Stat(filepath.Join(storeDir, name)); err != nil {
-		t.Fatalf("引用核验失败时不得删除媒体：%v", err)
 	}
 }
 
@@ -511,17 +286,11 @@ func TestSweepMediaDir(t *testing.T) {
 	}
 }
 
-func TestCreateIssueSchemaImagesConditional(t *testing.T) {
+func TestCreateIssueSchemaAlwaysIncludesImages(t *testing.T) {
 	s := &Server{cfg: &Config{}}
 	schema := s.createIssueSchema("repo 说明")
-	if _, ok := schema["properties"].(map[string]any)["images"]; ok {
-		t.Error("未配置服务器媒体存储时不应暴露 images 参数")
-	}
-	s.cfg.MediaStoreDir = t.TempDir()
-	s.cfg.MediaPublicBaseURL = "https://astrbot.example/issue-media"
-	schema = s.createIssueSchema("repo 说明")
 	if _, ok := schema["properties"].(map[string]any)["images"]; !ok {
-		t.Fatal("配置服务器媒体存储后应暴露 images 参数")
+		t.Fatal("create_issue schema 应始终暴露 images 参数")
 	}
 	if _, err := json.Marshal(schema); err != nil {
 		t.Fatalf("schema 应可序列化：%v", err)
@@ -529,7 +298,7 @@ func TestCreateIssueSchemaImagesConditional(t *testing.T) {
 }
 
 // TestProcessMediaPerItemUploadLimit 覆盖按项限额：额度只有 1 时，一次调用里的
-// 两个合法图片只保存第一个，第二个以「上限」告警返回，而不是共享同一次配额。
+// 两个合法图片只上传第一个，第二个以「上限」告警返回，而不是共享同一次配额。
 func TestProcessMediaPerItemUploadLimit(t *testing.T) {
 	s := newMediaTestServer(t)
 	s.mediaLimiter = newIssueRateLimiter(1)
@@ -538,32 +307,32 @@ func TestProcessMediaPerItemUploadLimit(t *testing.T) {
 	}))
 	defer img.Close()
 
-	res := s.processMedia(context.Background(), "repo", []string{img.URL, img.URL})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{img.URL, img.URL})
 	if res.imageCount != 1 {
 		t.Errorf("额度为 1 时应只成功 1 张，实际 imageCount=%d", res.imageCount)
 	}
 	if len(res.warnings) != 1 || !strings.Contains(res.warnings[0], "上限") {
 		t.Errorf("第二张应报上限告警，实际 warnings=%v", res.warnings)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 1 {
-		t.Errorf("应只保存 1 个媒体文件，实际 %d 个", got)
+	if got := len(s.attachmentUploader.(*fakeAttachmentUploader).uploads); got != 1 {
+		t.Errorf("应只上传 1 个媒体文件，实际 %d 个", got)
 	}
 }
 
 // TestProcessMediaRelativePathUnderMediaSourceDir 覆盖相对路径解析：模型常给
 // 相对文件名，images 里的相对路径应按 MediaSourceDir 解析，解析后位于目录内
-// 即放行保存。
+// 即放行上传。
 func TestProcessMediaRelativePathUnderMediaSourceDir(t *testing.T) {
 	s := newMediaTestServer(t)
 	if err := os.WriteFile(filepath.Join(s.cfg.MediaSourceDir, "capture.png"), pngBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res := s.processMedia(context.Background(), "repo", []string{"capture.png"})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{"capture.png"})
 	if res.imageCount != 1 || len(res.warnings) != 0 {
 		t.Fatalf("相对路径 capture.png 应解析到 MediaSourceDir 并成功，imageCount=%d warnings=%v", res.imageCount, res.warnings)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 1 {
-		t.Errorf("应保存 1 个媒体文件，实际 %d 个", got)
+	if got := len(s.attachmentUploader.(*fakeAttachmentUploader).uploads); got != 1 {
+		t.Errorf("应上传 1 个媒体文件，实际 %d 个", got)
 	}
 }
 
@@ -571,11 +340,9 @@ func loadMappedMediaConfig(t *testing.T, sourceDir string) *Config {
 	t.Helper()
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	raw, err := json.Marshal(map[string]any{
-		"dataDir":            t.TempDir(),
-		"mediaStoreDir":      t.TempDir(),
-		"mediaPublicBaseURL": "https://astrbot.example/issue-media",
-		"mediaSourceDir":     sourceDir,
-		"mediaSourcePrefix":  "/AstrBot/data/temp",
+		"dataDir":           t.TempDir(),
+		"mediaSourceDir":    sourceDir,
+		"mediaSourcePrefix": "/AstrBot/data/temp",
 		"repos": []map[string]any{{
 			"name": "repo",
 			"url":  "https://github.com/example-owner/test.git",
@@ -604,14 +371,13 @@ func TestProcessMediaMappedSourcePrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res := s.processMedia(context.Background(), "repo",
-		[]string{"/AstrBot/data/temp/capture.png"})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{"/AstrBot/data/temp/capture.png"})
 	if res.imageCount != 1 || len(res.warnings) != 0 {
 		t.Fatalf("容器路径应映射到媒体源目录并成功附带，imageCount=%d warnings=%v",
 			res.imageCount, res.warnings)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 1 {
-		t.Errorf("应保存 1 个媒体文件，实际 %d 个", got)
+	if got := len(s.attachmentUploader.(*fakeAttachmentUploader).uploads); got != 1 {
+		t.Errorf("应上传 1 个媒体文件，实际 %d 个", got)
 	}
 }
 
@@ -627,14 +393,13 @@ func TestProcessMediaMappedSourcePrefixWithRelativeRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res := s.processMedia(context.Background(), "repo",
-		[]string{"/AstrBot/data/temp/capture.png"})
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{"/AstrBot/data/temp/capture.png"})
 	if res.imageCount != 1 || len(res.warnings) != 0 {
 		t.Fatalf("相对媒体源目录不应被重复拼接，imageCount=%d warnings=%v",
 			res.imageCount, res.warnings)
 	}
-	if got := len(storedMediaEntries(t, s)); got != 1 {
-		t.Errorf("应保存 1 个媒体文件，实际 %d 个", got)
+	if got := len(s.attachmentUploader.(*fakeAttachmentUploader).uploads); got != 1 {
+		t.Errorf("应上传 1 个媒体文件，实际 %d 个", got)
 	}
 }
 
@@ -650,9 +415,9 @@ func TestProcessMediaSymlinkEscapeRejected(t *testing.T) {
 	if err := os.Symlink(outside, link); err != nil {
 		t.Skipf("环境不支持符号链接：%v", err)
 	}
-	res := s.processMedia(context.Background(), "repo", []string{link})
-	if res.imageCount != 0 || len(storedMediaEntries(t, s)) != 0 {
-		t.Fatalf("指向目录外的符号链接应被拒绝且不落盘，imageCount=%d md=%q", res.imageCount, res.md)
+	res := s.processMedia(context.Background(), mediaTestRepo, []string{link})
+	if res.imageCount != 0 || len(mediaTempEntries(t, s)) != 0 {
+		t.Fatalf("指向目录外的符号链接应被拒绝且不遗留临时文件，imageCount=%d md=%q", res.imageCount, res.md)
 	}
 	if len(res.warnings) == 0 {
 		t.Error("拒绝时应给出告警")
@@ -693,41 +458,118 @@ func TestSweepMediaDirKeepsUnrelatedFiles(t *testing.T) {
 	}
 }
 
-// TestSweepOrphanMediaGlobalSearch 覆盖引用核验的搜索范围：hex token 命中的
-// issue 可能在任意仓库（含未配置仓库），引用核验必须用全局查询；只查配置仓库
-// 会漏掉未配置仓库里的引用，把仍被引用的媒体误删。
-func TestSweepOrphanMediaGlobalSearch(t *testing.T) {
-	storeDir := t.TempDir()
-	oldStamp := time.Now().UTC().Add(-8 * 24 * time.Hour).Format("20060102-150405")
-	name := oldStamp + "-deadbeef0001.png"
-	if err := os.WriteFile(filepath.Join(storeDir, name), pngBytes, 0o644); err != nil {
+type attachmentUploadSnapshot struct {
+	Name        string
+	ContentType string
+	Size        int64
+	Bytes       []byte
+}
+
+type fakeAttachmentUploader struct {
+	failAt  map[int]error
+	uploads []attachmentUploadSnapshot
+}
+
+func (f *fakeAttachmentUploader) Upload(_ context.Context, _ string, _ int64, in attachmentInput) (uploadedAttachment, error) {
+	data, err := io.ReadAll(in.Reader)
+	if err != nil {
+		return uploadedAttachment{}, err
+	}
+	index := len(f.uploads)
+	f.uploads = append(f.uploads, attachmentUploadSnapshot{
+		Name:        in.Name,
+		ContentType: in.ContentType,
+		Size:        in.Size,
+		Bytes:       data,
+	})
+	if err := f.failAt[index]; err != nil {
+		return uploadedAttachment{}, err
+	}
+	ids := []string{
+		"11111111-1111-4111-8111-111111111111",
+		"22222222-2222-4222-8222-222222222222",
+		"33333333-3333-4333-8333-333333333333",
+	}
+	return uploadedAttachment{
+		Name: in.Name,
+		URL:  "https://github.com/user-attachments/assets/" + ids[index],
+	}, nil
+}
+
+func validPNG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	var body bytes.Buffer
+	if err := png.Encode(&body, image.NewRGBA(image.Rect(0, 0, width, height))); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/search/issues") {
-			http.NotFound(w, r)
+	return body.Bytes()
+}
+
+func TestProcessMediaNativeAttachmentsFailOpen(t *testing.T) {
+	sourceDir := t.TempDir()
+	tempDir := t.TempDir()
+	pngBody := validPNG(t, 640, 480)
+	var paths []string
+	for i := range 3 {
+		path := filepath.Join(sourceDir, fmt.Sprintf("capture-%d.png", i))
+		if err := os.WriteFile(path, pngBody, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, path)
+	}
+	var repoIDCalls int
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource" {
+			repoIDCalls++
+			_, _ = w.Write([]byte(`{"id":1026542182}`))
 			return
 		}
-		q := r.URL.Query().Get("q")
-		if !strings.Contains(q, "deadbeef0001") || strings.Contains(q, "repo:") {
-			t.Errorf("全局检索应只含 token、不限定 repo，实际 q=%q", q)
-		}
-		_, _ = w.Write([]byte(`{"total_count":1,"items":[{"number":9,"title":"引用在未配置仓库","state":"open"}]}`))
+		http.NotFound(w, r)
 	}))
-	t.Cleanup(srv.Close)
+	defer github.Close()
+	uploader := &fakeAttachmentUploader{failAt: map[int]error{
+		1: fmt.Errorf("session expired: %w", errAttachmentSessionExpired),
+	}}
 	s := &Server{
 		cfg: &Config{
-			MediaStoreDir:      storeDir,
-			MediaPublicBaseURL: "https://astrbot.example/issue-media",
-			GitHubToken:        "gtok",
-			mediaTimeout:       10 * time.Second,
+			MediaSourceDir:   sourceDir,
+			MediaTempDir:     tempDir,
+			mediaTimeout:     10 * time.Second,
+			mediaUploadLimit: 10,
 		},
-		gh:    NewGitHub(srv.URL, 10*time.Second),
-		store: NewStore([]*Repo{{Name: "fb", Slug: "example-owner/ExampleFeedback", IssueRead: true, GHToken: "t"}}),
+		gh:                 NewGitHub(github.URL, 10*time.Second),
+		mediaLimiter:       newIssueRateLimiter(10),
+		attachmentUploader: uploader,
+		attachmentStatus:   newAttachmentStatusCache(attachmentStatus{Configured: true, Authenticated: true, Account: "github-attachment-bot"}),
 	}
-
-	s.sweepOrphanMedia(context.Background())
-	if _, err := os.Stat(filepath.Join(storeDir, name)); err != nil {
-		t.Fatalf("未配置仓库的 issue 已引用时不得删除媒体：%v", err)
+	repo := &Repo{Name: "example-source", Slug: "example-owner/ExampleSource", GHToken: "token"}
+	res := s.processMedia(context.Background(), repo, paths)
+	if res.requested != 3 || res.imageCount != 2 || res.failed != 1 {
+		t.Fatalf("res=%+v", res)
+	}
+	if repoIDCalls != 1 {
+		t.Fatalf("RepoID 调用=%d", repoIDCalls)
+	}
+	if len(uploader.uploads) != 3 || !bytes.Equal(uploader.uploads[0].Bytes, pngBody) {
+		t.Fatalf("uploads=%+v", uploader.uploads)
+	}
+	for _, want := range []string{
+		`<img width="640" height="480" alt="Image" src="https://github.com/user-attachments/assets/11111111-1111-4111-8111-111111111111" />`,
+		`<img width="640" height="480" alt="Image" src="https://github.com/user-attachments/assets/33333333-3333-4333-8333-333333333333" />`,
+	} {
+		if !strings.Contains(res.md, want) {
+			t.Fatalf("正文缺少 %q：%s", want, res.md)
+		}
+	}
+	if strings.Contains(res.md, "session expired") || len(res.warnings) != 1 {
+		t.Fatalf("md=%q warnings=%v", res.md, res.warnings)
+	}
+	if status := s.attachmentStatus.load(); status.Authenticated {
+		t.Fatalf("Session 失效后健康状态仍为已认证：%+v", status)
+	}
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("AstrBot 源文件被删除：%v", err)
+		}
 	}
 }

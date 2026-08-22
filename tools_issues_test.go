@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -70,7 +74,7 @@ func TestRenderIssueBody(t *testing.T) {
 			r:    fb,
 			body: "工具栏消失。", evidence: "", confirmed: false,
 			reporter: "王五(QQ9)", repro: "", env: "v0.1.0 / Windows 11 / 安装包 / 截图",
-			media:     "![截图](https://astrbot.example/issue-media/a.png)",
+			media:     "![截图](https://github.com/user-attachments/assets/11111111-1111-4111-8111-111111111111)",
 			wantHas:   []string{"## 附件", "![截图](https://", "群聊反馈"},
 			wantNot:   []string{"## 调研结论"},
 			wantOrder: []string{"## 环境", "## 附件"},
@@ -305,5 +309,89 @@ func TestToolListReleasesRendersTagDateName(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("list_releases 输出应包含 %q（tag / 发布日期 / 发布名称），实际输出：\n%s", want, out)
 		}
+	}
+}
+
+func TestCreateIssueContinuesWhenAllNativeAttachmentsFail(t *testing.T) {
+	sourceDir := t.TempDir()
+	imagePath := filepath.Join(sourceDir, "capture.png")
+	if err := os.WriteFile(imagePath, validPNG(t, 32, 24), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var createCalls int
+	var createdBody string
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource":
+			_, _ = w.Write([]byte(`{"id":1026542182}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/example-owner/ExampleSource/issues":
+			createCalls++
+			var payload struct {
+				Title string `json:"title"`
+				Body  string `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			createdBody = payload.Body
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number":   19,
+				"title":    payload.Title,
+				"body":     payload.Body,
+				"state":    "open",
+				"html_url": "https://github.com/example-owner/ExampleSource/issues/19",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer github.Close()
+	repo := &Repo{
+		Name:       "fork",
+		Slug:       "example-owner/ExampleSource",
+		HasCode:    false,
+		IssueRead:  true,
+		IssueWrite: true,
+		GHToken:    "token",
+	}
+	s := &Server{
+		cfg: &Config{
+			MaxResponseBytes: 8192,
+			MediaSourceDir:   sourceDir,
+			MediaTempDir:     t.TempDir(),
+			mediaTimeout:     10 * time.Second,
+			issueLimit:       5,
+			mediaUploadLimit: 10,
+		},
+		store:              NewStore([]*Repo{repo}),
+		gh:                 NewGitHub(github.URL, 10*time.Second),
+		limiter:            newIssueRateLimiter(5),
+		mediaLimiter:       newIssueRateLimiter(10),
+		attachmentUploader: &fakeAttachmentUploader{failAt: map[int]error{0: errors.New("session expired")}},
+	}
+	out, err := s.toolCreateIssue(context.Background(), map[string]any{
+		"repo":                  "fork",
+		"title":                 "[Bug] 原生附件失败开放测试",
+		"body":                  "问题描述：上传截图失败时仍然需要提交完整的问题正文供维护者跟进。",
+		"env":                   "软件版本：未提供；操作系统：Windows；安装方式：未提供；问题场景：截图",
+		"reporter":              "测试用户",
+		"images":                imagePath,
+		"confirm_not_duplicate": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if createCalls != 1 {
+		t.Fatalf("create calls=%d", createCalls)
+	}
+	if strings.Contains(createdBody, "## 附件") {
+		t.Fatalf("全部失败时正文不应出现附件段：%s", createdBody)
+	}
+	if !strings.Contains(out, "已创建 issue #19") ||
+		!strings.Contains(out, "请求附件 1 个：成功 0 个，失败 1 个") {
+		t.Fatalf("tool response=%s", out)
 	}
 }

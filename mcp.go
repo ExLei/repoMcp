@@ -364,10 +364,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Error    string `json:"error,omitempty"`
 	}
 	out := struct {
-		Server string       `json:"server"`
-		Ready  bool         `json:"ready"`
-		Repos  []repoHealth `json:"repos"`
-	}{Server: serverTitle + "/" + serverVersion}
+		Server             string           `json:"server"`
+		Ready              bool             `json:"ready"`
+		Repos              []repoHealth     `json:"repos"`
+		AttachmentUploader attachmentStatus `json:"attachmentUploader"`
+	}{
+		Server:             serverTitle + "/" + serverVersion,
+		AttachmentUploader: s.attachmentStatus.load(),
+	}
 
 	ready := true
 	for _, r := range s.store.Repos() {

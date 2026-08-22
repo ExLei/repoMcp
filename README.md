@@ -50,7 +50,7 @@
 
 | 工具 | 用途 | 权限 |
 |---|---|---|
-| `create_issue` | 代用户提交 issue，正文由服务端按模板渲染；配置服务器媒体目录与公开 URL 后支持 `images` 参数（相关截图/视频随正文永久保存） | 仅配置的可写仓库；管理员（`adminReporters`）可对任意仓库（token 可访问的）写入 |
+| `create_issue` | 代用户提交 issue，正文由服务端按模板渲染；`images` 会尝试上传为 GitHub 原生 `user-attachments`，附件失败不阻止 issue 创建 | 仅配置的可写仓库；管理员（`adminReporters`）可对任意仓库（token 可访问的）写入 |
 | `update_issue` | 追加评论、关闭、重开、增删标签 | 同上；**追加评论（action=comment）仅管理员可执行** |
 
 服务在 `initialize` 时会下发 `instructions`，向模型声明可用仓库、各仓的 issue 能力、工具选择规则，以及**必须引用来源、检索无果时不得编造**。
@@ -67,6 +67,11 @@
   "syncInterval": "15m",
   "maxResponseBytes": 12000,
   "githubToken": "有 issues 权限的 PAT",
+  "githubAttachmentSessionFile": "/opt/repomcp/secrets/github-attachment-session",
+  "githubAttachmentAccount": "github-attachment-bot",
+  "mediaSourceDir": "/opt/astrbot/data/temp",
+  "mediaSourcePrefix": "/AstrBot/data/temp",
+  "mediaTempDir": "./data/media-temp",
   "maxIssueCreatesPerHour": 5,
   "adminReporters": ["管理员甲", "100000001"],
   "astrbotAdminsFile": "/AstrBot/data/cmd_config.json",
@@ -96,20 +101,20 @@
 | `repos[].webBase` | permalink 前缀。留空则从 `url` 推导（会剥掉内嵌凭据） |
 | `repos[].include` / `exclude` | 通配符过滤，支持 `*`（不跨 `/`）、`**`（跨 `/`）、`?`；不含 `/` 的模式匹配文件名 |
 | `repos[].dir` | 覆盖本地路径。**不要指向你的开发工作树**——同步会 `reset --hard` + `clean -fd` |
-| `githubToken` | issue 工具用的 PAT（写操作需 `issues:write`）。留空则 issue 只能读公开仓且限流严格 |
+| `githubToken` | issue 查询、创建与更新使用的 PAT（写操作需 `issues:write`）；不参与原生附件上传。留空则 issue 只能读公开仓且限流严格 |
+| `githubAttachmentSessionFile` | GitHub 网页 `user_session` 原始值所在文件；必须与 `githubAttachmentAccount` 同时配置。文件必须是非软链普通文件、权限不宽于 `0600`，配置中只写路径，绝不写 Session 值 |
+| `githubAttachmentAccount` | 上述 Session 必须对应的低权限专用账号；启动时精确核验身份 |
 | `githubApiBase` | API 根地址，默认 `https://api.github.com`；GHE 填 `https://<host>/api/v3` |
-| `githubTimeout` | 单次 GitHub API 调用超时，默认 `20s` |
+| `githubTimeout` | 单次 GitHub API 或身份检查超时，默认 `20s` |
 | `maxIssueCreatesPerHour` | 单仓每小时创建 issue 的上限，默认 5，`0` 表示不限 |
-| `mediaStoreDir` | 已校验媒体在服务器上的持久目录；与 `mediaPublicBaseURL` 必须同时配置，留空则禁用 issue 媒体 |
-| `mediaPublicBaseURL` | `mediaStoreDir` 对外公开的 HTTPS URL 前缀，必须带非根路径且无查询参数；反向代理应只转发该路径 |
 | `imageDownloadHosts` | 允许下载的图片 URL 域名白名单（后缀匹配），默认 `["qpic.cn","qq.com"]`。白名单之外一律拒绝——SSRF 与 Cookie 外泄防线 |
 | `imageDownloadAllowPrivate` | 允许白名单域名解析到私网/环回地址（默认 `false`）。仅内网图源场景显式打开 |
 | `imageDownloadCookie` | 下载**白名单域名**图片时附加的 Cookie。只会发给白名单 host，绝不发给其他域名 |
 | `mediaSourceDir` | images 本地路径的根目录：路径必须位于其中。留空 = 不接受本地路径（只收 URL） |
 | `mediaSourcePrefix` | 可选的调用方可见绝对路径前缀；其下路径按相对部分映射到 `mediaSourceDir`。例如 AstrBot 容器 `/AstrBot/data/temp` → 宿主机 `/opt/astrbot/data/temp` |
-| `mediaTimeout` | 单个媒体下载/保存超时，默认 `60s` |
-| `mediaTempDir` | 媒体下载临时目录，默认 `<dataDir>/media-tmp`；孤儿文件每小时清理（>24h） |
-| `maxMediaUploadsPerHour` | 每仓每小时媒体保存数上限，默认 20，`0` 不限；独立于 issue 创建限额 |
+| `mediaTimeout` | 单个媒体下载/上传超时，默认 `60s` |
+| `mediaTempDir` | URL 媒体的 staging 临时目录，默认 `<dataDir>/media-tmp`；repoMcp 创建的孤儿临时文件每小时清理（>24h） |
+| `maxMediaUploadsPerHour` | 每仓每小时媒体上传数上限，默认 20，`0` 不限；独立于 issue 创建限额 |
 
 
 | `repos[].issues` | 省略 = 该仓无 issue 能力；`{}` = 只读；`{"write": true}` = 可创建与管理 |
@@ -117,11 +122,13 @@
 | `repos[].issues.token` | 覆盖全局 `githubToken`（跨组织多 PAT 时用） |
 | `repos[].issues.labels` | 允许模型使用的标签白名单。留空则以仓库现有标签为准 |
 
-媒体接收规则：URL 下载只接受 `imageDownloadHosts` 白名单域名且解析为公网地址（默认拒绝私网，防 SSRF）；单个附件 ≤100MB、单次最多 10 个；类型限 png/jpg/gif/webp 图片与 mp4/mov 视频（按魔数嗅探，不信扩展名）。校验通过后原子写入 `mediaStoreDir`，issue 只引用 `mediaPublicBaseURL`；公开 HTTP 路径仅允许 GET/HEAD 和本服务生成的扁平文件名，不提供目录列表。单个附件失败不阻断 issue 创建，失败项以告警形式返回。
+issue REST 与原生附件使用两套独立凭据：`githubToken` PAT 只负责 issue 查询/写入；`githubAttachmentSessionFile` 中的浏览器 Session 只负责 GitHub 网页原生附件协议，不替换 PAT。不存在 GitHub 媒体仓库，也不存在 repoMcp 服务器永久图床。
 
-孤儿媒体清扫：持久保存成功但 issue 创建/更新失败（或进程崩溃）会遗留无人引用的服务器文件。服务每天自动清扫一次——只处理符合本服务命名模式、超过 7 天宽限期、且随机 hex 未被任何 issue 仓搜索索引命中的文件；命名不符、宽限期内或引用核验失败时保留。
+媒体接收规则：URL 下载只接受 `imageDownloadHosts` 白名单域名且解析为公网地址（默认拒绝私网，防 SSRF）；本地路径只允许 `mediaSourceDir` 内的文件；单个附件 ≤100MB、单次最多 10 个；类型限 png/jpg/gif/webp 图片与 mp4/mov 视频（按魔数嗅探，不信扩展名）。校验后流式上传到 GitHub，issue 正文引用 `https://github.com/user-attachments/assets/<UUID>`。成功项按输入顺序保留；部分或全部失败仍创建/更新 issue，工具结果会报告请求、成功、失败数量与逐项原因。
 
+repoMcp 只清理自己在 `mediaTempDir` 创建的 URL 下载 staging 文件；不会删除 AstrBot 拥有的 `mediaSourceDir` 源文件。进程崩溃遗留的 repoMcp 临时文件超过 24 小时后清理。
 
+GitHub 原生附件是未公开网页协议，GitHub 改版可能导致上传失效；issue 主流程仍保持 fail-open。专用 Firefox 会话可用 `gh image extract-token` 提取、`gh image check-token` 核验后，通过隐藏输入安装到 Session 文件。轮换或撤销时在 GitHub 账号的 Sessions 页面退出该专用会话，替换/删除服务器 `0600` 文件并重启服务；不要把 Session 值写入配置、命令行参数、日志或聊天。
 
 环境变量可覆盖：`REPOMCP_CONFIG` / `REPOMCP_LISTEN` / `REPOMCP_TOKEN` / `REPOMCP_DATA` / `REPOMCP_GITHUB_TOKEN`。
 
@@ -137,7 +144,7 @@ task build                        # 交叉编译 linux-amd64 到 build/repomcp
 
 启动后服务立即可用，首次 clone 与索引在后台进行；未就绪时工具会明确回复「索引进行中」而非空结果。
 
-探活：`GET /healthz`（无需鉴权），返回每个仓的 HEAD、文件数、符号数、上次同步时间、错误，以及 issue 能力（`off` / `read` / `write`）。全部仓库就绪前返回 `503`。
+探活：`GET /healthz`（无需鉴权），返回每个仓的 HEAD、文件数、符号数、上次同步时间、错误、issue 能力（`off` / `read` / `write`），以及 `attachmentUploader.configured` / `authenticated` / `account`。附件未配置或认证失效不影响顶层 `ready`；全部有源码仓库就绪前返回 `503`。响应不会包含 Session、Cookie 或 secret 文件路径。
 
 ## 接入 LangBot
 
