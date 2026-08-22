@@ -17,7 +17,7 @@
 | 输出是紧凑纯文本，不是 JSON | JSON 包装只增加 token，对模型阅读无收益 |
 | 每条结果带 `路径:行号` + 钉住 commit 的 permalink | 答案必须能被人工核验，否则代码问答没有价值 |
 | 硬字节预算（`maxResponseBytes`） | LangBot **不截断** tool 返回，服务端必须自己收口 |
-| 只读查询工具常驻，写工具按能力动态挂载 | issue / PR / Release 可查询任意公开仓库；未配置可写仓库时不暴露 `create_issue` / `update_issue` |
+| 只读查询工具常驻，写工具按能力动态挂载 | issue / PR / Release 支持配置仓库或 GitHub token 可访问的 `owner/name`；未配置可写仓库时不暴露 `create_issue` / `update_issue` |
 | 可硬校验的写操作护栏落在服务端 | 「先调研再提 issue」「别重复提」「别随手关」写进提示词只是建议，能由服务端判断的规则必须硬校验 |
 | 词法 + 符号表，不做向量检索 | 代码检索里标识符精确匹配的召回远超 embedding；向量的复杂度换不来相应收益 |
 
@@ -33,7 +33,7 @@
 | `find_symbol` | 按名字查定义，返回签名与文档注释。已知符号名时比 `search_code` 精确 |
 | `git_history` | 提交历史，回答「为什么这么写」「什么时候加的」 |
 
-**issue / PR 查询（无条件挂载，任意公开仓库只读）**
+**issue / PR 查询（无条件挂载，配置仓库或 token 可访问仓库只读）**
 
 | 工具 | 用途 |
 |---|---|
@@ -44,14 +44,14 @@
 | `read_pull` | 读单个 PR 的完整描述、状态与分支信息 |
 | `list_pull_comments` | 列 PR 的讨论评论 |
 
-`repo` 参数支持配置短名或任意公开仓库 `owner/name`（如 `example-owner/example-repo`）。
+`repo` 参数支持配置短名或任意 `owner/name`（如 `example-owner/example-repo`）；任意路径复用 `githubToken`，可能读取 token 可访问的私有仓库，不是“公开仓库”硬边界，面向群聊时调用方必须只允许配置仓库或已确认公开仓库。
 
 **issue 写入（配置了 `repos[].issues.write` 才挂载）**
 
 | 工具 | 用途 | 权限 |
 |---|---|---|
-| `create_issue` | 代用户提交 issue，正文由服务端按模板渲染；`images` 会尝试上传为 GitHub 原生 `user-attachments`，附件失败不阻止 issue 创建 | 仅配置的可写仓库；管理员（`adminReporters`）可对任意仓库（token 可访问的）写入 |
-| `update_issue` | 追加评论、关闭、重开、增删标签；`images` 在 `edit_body` 时附到正文，在 `comment` / `close` / `reopen` 时附到评论，并支持纯图片评论 | 同上；**追加评论（action=comment）仅管理员可执行** |
+| `create_issue` | 代用户提交 issue，正文由服务端按模板渲染；`images` 会尝试上传为 GitHub 原生 `user-attachments`，附件失败不阻止 issue 创建 | 仅配置的可写仓库；管理员（`adminReporters` ∪ `astrbotAdminsFile` 的 `admins_id`）可对任意仓库（token 可访问的）写入 |
+| `update_issue` | 追加评论、关闭、重开、修改标题/正文、增删标签；`images` 在 `edit_body` 时附到正文，在 `comment` / `close` / `reopen` 时附到评论，并支持纯图片评论 | 同上；**追加评论（action=comment）仅管理员可执行** |
 
 服务在 `initialize` 时会下发 `instructions`，向模型声明可用仓库、各仓的 issue 能力、工具选择规则，以及**必须引用来源、检索无果时不得编造**。
 
@@ -73,7 +73,7 @@
   "mediaSourcePrefix": "/AstrBot/data/temp",
   "mediaTempDir": "./data/media-temp",
   "maxIssueCreatesPerHour": 5,
-  "adminReporters": ["管理员昵称", "QQ号 xxxxxxx"],
+  "adminReporters": ["123456789"],
   "astrbotAdminsFile": "/AstrBot/data/cmd_config.json",
   "repos": [
     {
@@ -106,8 +106,8 @@
 | `githubAttachmentAccount` | 上述 Session 必须对应的低权限专用账号；启动时精确核验身份 |
 | `githubApiBase` | API 根地址，默认 `https://api.github.com`；GHE 填 `https://<host>/api/v3` |
 | `githubTimeout` | 单次 GitHub API 或身份检查超时，默认 `20s` |
-| `maxIssueCreatesPerHour` | 单仓每小时创建 issue 的上限，默认 5，`0` 表示不限 |
-| `adminReporters` | 可执行管理员操作的报告人标识，如昵称或 QQ 号；示例值必须替换，不能把真实身份写入公开配置 |
+| `maxIssueCreatesPerHour` | 每个仓库键每小时创建 issue 的上限，默认 5，`0` 表示不限；管理员任意 `owner/name` 路径按传入大小写键控，调用方必须统一小写 |
+| `adminReporters` | 管理员路由护栏，只配置不可变的平台账号原始 ID（如纯数字 QQ 号），不得使用可变昵称；与 `astrbotAdminsFile` 的 `admins_id` 合并。它不是独立认证，服务安全边界仍是 Bearer token |
 | `astrbotAdminsFile` | 可选的 AstrBot 管理员配置路径；其 `admins_id` 会与 `adminReporters` 合并 |
 | `imageDownloadHosts` | 允许下载的图片 URL 域名白名单（后缀匹配），默认 `["qpic.cn","qq.com"]`。白名单之外一律拒绝——SSRF 与 Cookie 外泄防线 |
 | `imageDownloadAllowPrivate` | 允许白名单域名解析到私网/环回地址（默认 `false`）。仅内网图源场景显式打开 |
@@ -116,7 +116,7 @@
 | `mediaSourcePrefix` | 可选的调用方可见绝对路径前缀；其下路径按相对部分映射到 `mediaSourceDir`。例如 AstrBot 容器 `/AstrBot/data/temp` → 宿主机 `/opt/astrbot/data/temp` |
 | `mediaTimeout` | 单个媒体下载/上传超时，默认 `60s` |
 | `mediaTempDir` | URL 媒体的 staging 临时目录，默认 `<dataDir>/media-tmp`；repoMcp 创建的孤儿临时文件每小时清理（>24h） |
-| `maxMediaUploadsPerHour` | 每仓每小时媒体上传数上限，默认 20，`0` 不限；独立于 issue 创建限额 |
+| `maxMediaUploadsPerHour` | 每个仓库键每小时媒体上传数上限，默认 20，`0` 不限；管理员任意 `owner/name` 路径按传入大小写键控，调用方必须统一小写；独立于 issue 创建限额 |
 
 
 | `repos[].issues` | 省略 = 该仓无 issue 能力；`{}` = 只读；`{"write": true}` = 可创建与管理 |
@@ -134,7 +134,7 @@ GitHub 原生附件是未公开网页协议，GitHub 改版可能导致上传失
 
 环境变量可覆盖：`REPOMCP_CONFIG` / `REPOMCP_LISTEN` / `REPOMCP_TOKEN` / `REPOMCP_DATA` / `REPOMCP_GITHUB_TOKEN`。
 
-私有仓：在 `url` 中内嵌 token（如 `https://x-access-token:<PAT>@github.com/owner/repo.git`），或在宿主上预先配好凭据助手。服务已强制 `GIT_TERMINAL_PROMPT=0`，凭据缺失会直接失败而不是挂起等待输入。
+私有仓：`url` 只写不含凭据的 HTTPS 地址，并在宿主机预先配置 git credential helper；不得把 PAT 内嵌进 URL（会进入 git argv、origin 与错误面）。服务强制 `GIT_TERMINAL_PROMPT=0`，凭据缺失会直接失败而不是挂起等待输入。
 
 ## 运行
 
@@ -173,11 +173,11 @@ LangBot 的 MCP 配置里新增一个 HTTP server：
 排障顺序：先 `curl <地址>/healthz` 看 `ready` 与每仓 `error`（此接口不需要鉴权），
 再用下面的探针验证 MCP 握手，最后才怀疑 LangBot 配置。
 
-**安全**：源码侧完全只读——不执行仓库中的任何代码，也不接受任意路径读取（`read_file` 只能读已索引的受版本控制文件，并拒绝 `..` 与绝对路径）。唯一的写入面是 issue，且实现上只有「创建 issue / 追加评论 / 修改标题与正文 / 修改状态与标签」，没有任何删除端点，最坏后果是产生可被人工撤销的 issue 内容变更。但本服务会把私有仓源码送进 LLM——请确认所用模型的数据策略，并把服务绑定在内网或 `127.0.0.1`。
+**安全**：源码侧完全只读——不执行仓库中的任何代码，也不接受任意路径读取（`read_file` 只能读已索引的受版本控制文件，并拒绝 `..` 与绝对路径）。唯一的写入面是 issue，且实现上只有「创建 issue / 追加评论 / 修改标题与正文 / 修改状态与标签」，没有删除端点；但这些变更仍可能影响真实项目，必须保护 Bearer token。服务会把已配置私有仓源码送进 LLM，任意 `owner/name` 的 issue / PR / Release 查询也会复用 GitHub token 并可能读取私有仓；请确认模型数据策略，把服务绑定在内网或 `127.0.0.1`，群聊调用方只放行配置仓库或已确认公开仓库。
 
 ## issue 能力
 
-issue / PR / Release 查询工具始终可用；只有配置了可写仓库时才会挂载 `create_issue` / `update_issue`，`repos[].issues.write` 决定该仓库能否写入。
+issue / PR / Release 查询工具始终可用，并可触达 GitHub token 有权读取的仓库；只有配置了可写仓库时才会挂载 `create_issue` / `update_issue`，`repos[].issues.write` 决定配置仓库能否写入。
 
 **为什么护栏在服务端**：消费方是 IM 里的小模型，「先调研再提」「别重复提」「别随手关」写进工具描述只是建议。凡是能硬校验的都在服务端拦：
 
@@ -185,7 +185,7 @@ issue / PR / Release 查询工具始终可用；只有配置了可写仓库时�
 |---|---|
 | 强制查重 | 创建前服务端自己再查一遍，命中疑似重复直接拒绝并列出候选；模型只能在逐条核对后带 `confirm_not_duplicate=true` 重试 |
 | 双路召回 | 搜索接口覆盖历史 issue，最近 open 列表兜底中文标题（GitHub 搜索对 CJK 分词很差）。标题按重叠系数打分，阈值 0.55 |
-| 频率上限 | 每仓每小时最多 `maxIssueCreatesPerHour` 个。配额在调用 GitHub **之前**扣除，失败重试也照扣 |
+| 频率上限 | 每个仓库键每小时最多 `maxIssueCreatesPerHour` 个；配额在调用 GitHub **之前**扣除，失败重试也照扣。管理员任意 `owner/name` 路径按传入大小写键控，调用方必须统一小写 |
 | 调研结论 | `confidence` 只能是 `confirmed` / `unconfirmed`；源码仓库必填，反馈仓库（无源码）可省略（默认 unconfirmed）；`confirmed` 时 `evidence` 里没有 `路径:行号` 形式的出处直接拒绝 |
 | 正文服务端渲染 | 模型只能填各段内容，结构固定：问题描述 → 复现 / 触发条件（可省略）→ 环境（必填）→ 调研结论（仅源码仓库）→ 提交来源 |
 | 标签白名单 | GitHub 打标签会顺手新建不存在的标签；只有仓库现有（或配置白名单里的）标签会被采用，其余忽略并在结果里说明 |
