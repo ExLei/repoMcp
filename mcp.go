@@ -1,8 +1,8 @@
 // MCP 协议层：无状态 Streamable HTTP 传输 + JSON-RPC 2.0 分发。
 //
-// 为什么是无状态：本服务的每个工具调用都是纯查询，不存在跨调用的会话态。
-// 因此不下发 Mcp-Session-Id，POST 一律以 application/json 单次响应；
-// 客户端（LangBot）随时重连都能立刻用，也无需服务端维护长连接与会话回收。
+// 为什么是无状态：每个请求都不依赖服务端 MCP 会话；写操作的结果持久化在 GitHub，
+// 但后续调用不需要复用连接或 Session ID。因此不下发 Mcp-Session-Id，POST 一律以
+// application/json 单次响应；客户端（LangBot）可随时重连，也无需维护会话回收。
 // GET/DELETE 因此返回 405——无服务端主动推送，也无会话可终止。
 package main
 
@@ -305,7 +305,7 @@ func (s *Server) instructions() string {
 5. 检索无结果时如实说明未找到，不要编造代码。
 `)
 	b.WriteString(`
-issue / PR 查询（任意公开仓库，repo 参数可用配置短名或 owner/name 如 example-owner/AstrBot）：
+issue / PR 查询（任意公开仓库，repo 参数可用配置短名或 owner/name，如 example-owner/example-repo）：
 6. 用户问「有没有人提过 / 这个功能什么进度」→ search_issues；要看细节与结论 → read_issue。
 7. 能靠检索代码直接回答的问题就直接回答，不要开 issue。issue 只用于缺陷、异常与功能需求。
 8. 用户问「有哪些 PR / 有人提 PR 吗 / PR 什么状态」→ search_pulls；详情 → read_pull；讨论 → list_pull_comments。

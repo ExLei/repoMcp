@@ -20,7 +20,7 @@ import (
 // pngBytes 是足以通过 http.DetectContentType 嗅探的最小 PNG 魔数。
 var pngBytes = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 0}
 
-var mediaTestRepo = &Repo{Name: "repo", Slug: "example-owner/ExampleSource", GHToken: "token"}
+var mediaTestRepo = &Repo{Name: "repo", Slug: "example-owner/example-repo", GHToken: "token"}
 
 // mp4Bytes 是 Go 嗅探器认可的 mp4 魔数（box 锚定在偏移 4：ftyp 盒 + isom brand），
 // 测试超大视频时只用头部 + 补零，不必真的构造 100MB 有效视频。
@@ -33,7 +33,7 @@ func mp4Bytes(size int) []byte {
 func newMediaTestServer(t *testing.T) *Server {
 	t.Helper()
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource" {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/example-repo" {
 			_, _ = w.Write([]byte(`{"id":1026542182}`))
 			return
 		}
@@ -519,7 +519,7 @@ func TestProcessMediaNativeAttachmentsFailOpen(t *testing.T) {
 	}
 	var repoIDCalls int
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource" {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/example-repo" {
 			repoIDCalls++
 			_, _ = w.Write([]byte(`{"id":1026542182}`))
 			return
@@ -540,9 +540,9 @@ func TestProcessMediaNativeAttachmentsFailOpen(t *testing.T) {
 		gh:                 NewGitHub(github.URL, 10*time.Second),
 		mediaLimiter:       newIssueRateLimiter(10),
 		attachmentUploader: uploader,
-		attachmentStatus:   newAttachmentStatusCache(attachmentStatus{Configured: true, Authenticated: true, Account: "github-attachment-bot"}),
+		attachmentStatus:   newAttachmentStatusCache(attachmentStatus{Configured: true, Authenticated: true, Account: "attachment-bot"}),
 	}
-	repo := &Repo{Name: "example-source", Slug: "example-owner/ExampleSource", GHToken: "token"}
+	repo := &Repo{Name: "source", Slug: "example-owner/example-repo", GHToken: "token"}
 	res := s.processMedia(context.Background(), repo, paths)
 	if res.requested != 3 || res.imageCount != 2 || res.failed != 1 {
 		t.Fatalf("res=%+v", res)

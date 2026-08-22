@@ -25,7 +25,7 @@ func writeConfigForTest(t *testing.T, raw map[string]any) string {
 func TestLoadConfigAttachmentCredentialsMustBePaired(t *testing.T) {
 	tests := []map[string]any{
 		{"githubAttachmentSessionFile": "/tmp/session"},
-		{"githubAttachmentAccount": "github-attachment-bot"},
+		{"githubAttachmentAccount": "attachment-bot"},
 	}
 	for i, raw := range tests {
 		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
@@ -40,10 +40,10 @@ func TestLoadConfigAttachmentCredentialsMustBePaired(t *testing.T) {
 func TestLoadConfigAcceptsPairedAttachmentCredentials(t *testing.T) {
 	path := writeConfigForTest(t, map[string]any{
 		"githubAttachmentSessionFile": " /opt/repomcp/secrets/github-attachment-session ",
-		"githubAttachmentAccount":     " github-attachment-bot ",
+		"githubAttachmentAccount":     " attachment-bot ",
 		"repos": []map[string]any{{
 			"name": "feedback",
-			"url":  "https://github.com/example-owner/ExampleSource.git",
+			"url":  "https://github.com/example-owner/example-repo.git",
 		}},
 	})
 	cfg, err := LoadConfig(path)
@@ -53,7 +53,7 @@ func TestLoadConfigAcceptsPairedAttachmentCredentials(t *testing.T) {
 	if cfg.GitHubAttachmentSessionFile != "/opt/repomcp/secrets/github-attachment-session" {
 		t.Fatalf("session file=%q", cfg.GitHubAttachmentSessionFile)
 	}
-	if cfg.GitHubAttachmentAccount != "github-attachment-bot" {
+	if cfg.GitHubAttachmentAccount != "attachment-bot" {
 		t.Fatalf("account=%q", cfg.GitHubAttachmentAccount)
 	}
 }
@@ -65,7 +65,7 @@ func TestLoadConfigRejectsRetiredServerMediaFields(t *testing.T) {
 				field: "/retired",
 				"repos": []map[string]any{{
 					"name": "feedback",
-					"url":  "https://github.com/example-owner/ExampleSource.git",
+					"url":  "https://github.com/example-owner/example-repo.git",
 				}},
 			}
 			_, err := LoadConfig(writeConfigForTest(t, raw))

@@ -20,10 +20,10 @@
   "repos": [
     {
       "name": "example-source",
-      "desc": "多协议下载器主仓：Flutter 桌面/移动端 + Rust 引擎 + 本机 API + Web SPA",
-      "url": "https://github.com/upstream-owner/ExampleSource.git",
+      "desc": "示例源码主仓：供模型检索源码并管理 issue",
+      "url": "https://github.com/example-owner/example-source.git",
       "ref": "main",
-      "webBase": "https://github.com/upstream-owner/ExampleSource",
+      "webBase": "https://github.com/example-owner/example-source",
       "exclude": [
         "assets/i18n/*.json",
         "packages/**"
@@ -39,16 +39,16 @@
     },
     {
       "name": "example-readonly",
-      "desc": "云端服务：账号 / 设备信任 / 套餐权益 / 配置同步（axum + SeaORM）",
-      "url": "https://github.com/upstream-owner/ExampleReadonly.git",
+      "desc": "示例只读仓：只开放源码与 issue 查询",
+      "url": "https://github.com/example-owner/example-readonly.git",
       "ref": "main",
-      "webBase": "https://github.com/upstream-owner/ExampleReadonly",
+      "webBase": "https://github.com/example-owner/example-readonly",
       "issues": {}
     }
   ],
   "adminReporters": [
-    "管理员甲",
-    "100000001"
+    "管理员昵称",
+    "QQ号 xxxxxxx"
   ],
   "astrbotAdminsFile": "/AstrBot/data/cmd_config.json"
 }

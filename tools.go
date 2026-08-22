@@ -117,7 +117,7 @@ func (s *Server) toolDefs() []toolDef {
 			Handle: s.toolGitHistory,
 		},
 	}
-	// issue 工具按配置动态挂载：没接入 issue 的部署仍然只有这 5 个检索工具。
+	// issue / PR 只读查询始终挂载；只有 create_issue / update_issue 按可写仓库配置动态挂载。
 	return append(append(defs, s.issueToolDefs()...), s.pullToolDefs()...)
 }
 

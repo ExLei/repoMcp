@@ -115,14 +115,14 @@ func TestNativeAttachmentIdentityUsesSessionCookiePair(t *testing.T) {
 		sawCookies = true
 		http.SetCookie(w, &http.Cookie{Name: "_gh_sess", Value: "rotated", Path: "/", Secure: true, HttpOnly: true})
 		w.Header().Set("Content-Type", "text/html")
-		_, _ = w.Write([]byte(`<html><head><meta name="user-login" content="github-attachment-bot"></head></html>`))
-	}), "github-attachment-bot")
+		_, _ = w.Write([]byte(`<html><head><meta name="user-login" content="attachment-bot"></head></html>`))
+	}), "attachment-bot")
 
 	got, err := uploader.checkIdentity(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "github-attachment-bot" || !sawCookies {
+	if got != "attachment-bot" || !sawCookies {
 		t.Fatalf("account=%q sawCookies=%v", got, sawCookies)
 	}
 	var rotated bool
@@ -145,7 +145,7 @@ func TestNativeAttachmentIdentityRejectsExpiredOrWrongAccount(t *testing.T) {
 	}{
 		{
 			name:     "expired",
-			expected: "github-attachment-bot",
+			expected: "attachment-bot",
 			handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Location", "/login")
 				w.WriteHeader(http.StatusFound)
@@ -154,15 +154,15 @@ func TestNativeAttachmentIdentityRejectsExpiredOrWrongAccount(t *testing.T) {
 		},
 		{
 			name:     "wrong-account",
-			expected: "github-attachment-bot",
+			expected: "attachment-bot",
 			handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte(`<meta name="user-login" content="example-owner">`))
+				_, _ = w.Write([]byte(`<meta name="user-login" content="different-account">`))
 			}),
 			want: errAttachmentAccountMismatch,
 		},
 		{
 			name:     "missing-meta",
-			expected: "github-attachment-bot",
+			expected: "attachment-bot",
 			handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte(`<html></html>`))
 			}),
@@ -186,7 +186,7 @@ func TestNativeAttachmentIdentityRejectsExpiredOrWrongAccount(t *testing.T) {
 func TestNativeAttachmentUploadDetectsExpiredSessionWhenTokenMissing(t *testing.T) {
 	uploader, _ := newIdentityUploaderForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/example-owner/ExampleSource":
+		case "/example-owner/example-repo":
 			_, _ = w.Write([]byte(`<html>public repository</html>`))
 		case "/settings/profile":
 			w.Header().Set("Location", "/login")
@@ -194,9 +194,9 @@ func TestNativeAttachmentUploadDetectsExpiredSessionWhenTokenMissing(t *testing.
 		default:
 			http.NotFound(w, r)
 		}
-	}), "github-attachment-bot")
+	}), "attachment-bot")
 
-	_, err := uploader.Upload(context.Background(), "example-owner/ExampleSource", 1026542182, attachmentInput{
+	_, err := uploader.Upload(context.Background(), "example-owner/example-repo", 1026542182, attachmentInput{
 		Name:        "capture.png",
 		ContentType: "image/png",
 		Size:        3,
@@ -219,7 +219,7 @@ func TestHealthReportsAttachmentUploaderStatusWithoutAffectingReadiness(t *testi
 			name: "configured-not-authenticated",
 			status: attachmentStatus{
 				Configured: true,
-				Account:    "github-attachment-bot",
+				Account:    "attachment-bot",
 			},
 		},
 		{
@@ -227,7 +227,7 @@ func TestHealthReportsAttachmentUploaderStatusWithoutAffectingReadiness(t *testi
 			status: attachmentStatus{
 				Configured:    true,
 				Authenticated: true,
-				Account:       "github-attachment-bot",
+				Account:       "attachment-bot",
 			},
 		},
 	}
@@ -236,7 +236,7 @@ func TestHealthReportsAttachmentUploaderStatusWithoutAffectingReadiness(t *testi
 			s := &Server{
 				cfg: &Config{
 					GitHubAttachmentSessionFile: "/opt/repomcp/secrets/session-secret",
-					GitHubAttachmentAccount:     "github-attachment-bot",
+					GitHubAttachmentAccount:     "attachment-bot",
 				},
 				store:            NewStore(nil),
 				index:            NewIndex(),
@@ -350,7 +350,7 @@ func TestNativeAttachmentUploadProtocol(t *testing.T) {
 
 	github := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/example-owner/ExampleFeedback":
+		case r.Method == http.MethodGet && r.URL.Path == "/example-owner/feedback-repo":
 			if _, err := r.Cookie("user_session"); err != nil {
 				http.Error(w, "missing session", http.StatusUnauthorized)
 				return
@@ -359,7 +359,7 @@ func TestNativeAttachmentUploadProtocol(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/upload/policies/assets":
 			if r.Header.Get("Accept") != "application/json" ||
 				r.Header.Get("Origin") != githubURL ||
-				r.Header.Get("Referer") != githubURL+"/example-owner/ExampleFeedback" ||
+				r.Header.Get("Referer") != githubURL+"/example-owner/feedback-repo" ||
 				r.Header.Get("X-Requested-With") != "XMLHttpRequest" {
 				http.Error(w, "wrong policy headers", http.StatusBadRequest)
 				return
@@ -411,7 +411,7 @@ func TestNativeAttachmentUploadProtocol(t *testing.T) {
 			})
 		case r.Method == http.MethodPut && r.URL.Path == "/upload/assets/99":
 			if r.Header.Get("Origin") != githubURL ||
-				r.Header.Get("Referer") != githubURL+"/example-owner/ExampleFeedback" ||
+				r.Header.Get("Referer") != githubURL+"/example-owner/feedback-repo" ||
 				r.Header.Get("X-Requested-With") != "XMLHttpRequest" {
 				http.Error(w, "wrong finalize headers", http.StatusBadRequest)
 				return
@@ -434,7 +434,7 @@ func TestNativeAttachmentUploadProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	uploader, err := buildNativeAttachmentUploader("session-secret", "github-attachment-bot", base, github.Client(), s3.Client())
+	uploader, err := buildNativeAttachmentUploader("session-secret", "attachment-bot", base, github.Client(), s3.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +444,7 @@ func TestNativeAttachmentUploadProtocol(t *testing.T) {
 		}
 		return nil
 	}
-	uploaded, err := uploader.Upload(context.Background(), "example-owner/ExampleFeedback", 1325294260, attachmentInput{
+	uploaded, err := uploader.Upload(context.Background(), "example-owner/feedback-repo", 1325294260, attachmentInput{
 		Name:        "capture.png",
 		ContentType: "image/png",
 		Size:        int64(len(fileBytes)),

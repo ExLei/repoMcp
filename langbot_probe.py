@@ -64,13 +64,13 @@ async def main():
             print("\n".join(rd["content"][0]["text"].splitlines()[:n]))
 
         print("\n--- tools/call: find_symbol ---")
-        show(await session.call_tool("find_symbol", {"name": "aria2StatusStr", "repo": "example-source"}))
+        show(await session.call_tool("find_symbol", {"name": "ExampleSymbol", "repo": "example-source"}))
 
         print("\n--- tools/call: search_code（跨仓）---")
         show(await session.call_tool("search_code", {"query": "jsDelivr 测速", "k": 2}), 5)
 
         print("\n--- tools/call: 错误路径应为 isError 而非协议异常 ---")
-        show(await session.call_tool("read_file", {"repo": "example-source", "path": "nope.rs"}), 2)
+        show(await session.call_tool("read_file", {"repo": "example-source", "path": "nope.go"}), 2)
 
         print("\n--- ping ---")
         await session.send_ping()

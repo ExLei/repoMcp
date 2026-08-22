@@ -4,7 +4,7 @@
 
 - 传输：**无状态 Streamable HTTP**，单端点 `POST /mcp`，Bearer 鉴权。
 - 检索：本地 clone + 内存倒排索引（BM25）+ 正则符号表。**不需要 embedding、向量库或任何外部服务**。
-- issue：可选开启，走 GitHub REST。只实现「建 / 评论 / 改状态与标签」，**没有任何删除动作**，且创建前强制查重与限频。
+- issue / PR：只读查询始终可用，issue 写入按配置开启，走 GitHub REST。写入只实现「创建 issue / 追加评论 / 修改标题与正文 / 修改状态与标签」，**不提供删除 issue 或评论的能力**，且创建前强制查重与限频。
 - 依赖：**零第三方 Go 依赖**，`CGO_ENABLED=0` 单二进制。运行期只要求宿主有 `git`。
 
 ## 设计取舍
@@ -17,8 +17,8 @@
 | 输出是紧凑纯文本，不是 JSON | JSON 包装只增加 token，对模型阅读无收益 |
 | 每条结果带 `路径:行号` + 钉住 commit 的 permalink | 答案必须能被人工核验，否则代码问答没有价值 |
 | 硬字节预算（`maxResponseBytes`） | LangBot **不截断** tool 返回，服务端必须自己收口 |
-| 工具按能力动态挂载 | 工具越多小模型选错概率越高；没接入 issue 的部署仍然只有 5 个检索工具 |
-| 写操作的护栏落在服务端 | 「先调研再提 issue」「别重复提」「别随手关」写进提示词只是建议，只有服务端硬校验拦得住 |
+| 只读查询工具常驻，写工具按能力动态挂载 | issue / PR / Release 可查询任意公开仓库；未配置可写仓库时不暴露 `create_issue` / `update_issue` |
+| 可硬校验的写操作护栏落在服务端 | 「先调研再提 issue」「别重复提」「别随手关」写进提示词只是建议，能由服务端判断的规则必须硬校验 |
 | 词法 + 符号表，不做向量检索 | 代码检索里标识符精确匹配的召回远超 embedding；向量的复杂度换不来相应收益 |
 
 ## 工具
@@ -44,7 +44,7 @@
 | `read_pull` | 读单个 PR 的完整描述、状态与分支信息 |
 | `list_pull_comments` | 列 PR 的讨论评论 |
 
-`repo` 参数支持配置短名或任意公开仓库 `owner/name`（如 `example-owner/AstrBot`）。
+`repo` 参数支持配置短名或任意公开仓库 `owner/name`（如 `example-owner/example-repo`）。
 
 **issue 写入（配置了 `repos[].issues.write` 才挂载）**
 
@@ -73,15 +73,15 @@
   "mediaSourcePrefix": "/AstrBot/data/temp",
   "mediaTempDir": "./data/media-temp",
   "maxIssueCreatesPerHour": 5,
-  "adminReporters": ["管理员甲", "100000001"],
+  "adminReporters": ["管理员昵称", "QQ号 xxxxxxx"],
   "astrbotAdminsFile": "/AstrBot/data/cmd_config.json",
   "repos": [
     {
-      "name": "example-source",
-      "desc": "多协议下载器主仓（这句话会展示给模型，帮它选对仓库）",
-      "url": "https://github.com/upstream-owner/ExampleSource.git",
+      "name": "example-repo",
+      "desc": "示例项目主仓（这句话会展示给模型，帮它选对仓库）",
+      "url": "https://github.com/example-owner/example-repo.git",
       "ref": "main",
-      "webBase": "https://github.com/upstream-owner/ExampleSource",
+      "webBase": "https://github.com/example-owner/example-repo",
       "exclude": ["packages/**"],
       "issues": { "write": true }
     }
@@ -107,6 +107,8 @@
 | `githubApiBase` | API 根地址，默认 `https://api.github.com`；GHE 填 `https://<host>/api/v3` |
 | `githubTimeout` | 单次 GitHub API 或身份检查超时，默认 `20s` |
 | `maxIssueCreatesPerHour` | 单仓每小时创建 issue 的上限，默认 5，`0` 表示不限 |
+| `adminReporters` | 可执行管理员操作的报告人标识，如昵称或 QQ 号；示例值必须替换，不能把真实身份写入公开配置 |
+| `astrbotAdminsFile` | 可选的 AstrBot 管理员配置路径；其 `admins_id` 会与 `adminReporters` 合并 |
 | `imageDownloadHosts` | 允许下载的图片 URL 域名白名单（后缀匹配），默认 `["qpic.cn","qq.com"]`。白名单之外一律拒绝——SSRF 与 Cookie 外泄防线 |
 | `imageDownloadAllowPrivate` | 允许白名单域名解析到私网/环回地址（默认 `false`）。仅内网图源场景显式打开 |
 | `imageDownloadCookie` | 下载**白名单域名**图片时附加的 Cookie。只会发给白名单 host，绝不发给其他域名 |
@@ -165,17 +167,17 @@ LangBot 的 MCP 配置里新增一个 HTTP server：
 - **`Authorization` 的值必须带 `Bearer ` 前缀**，只填裸 token 会得到 401。
 - URL 建议写全 `/mcp`。只填域名也能用（根路径做了兜底），但写全更明确。
 - `timeout` 是连接与初始化超时；`tool_call_timeout_sec` 是单次工具调用超时，`git_history` 在大仓上可能偏慢，建议 ≥ 60。
-- 配置完成后在聊天里发 `!func` 可确认工具已注册：检索 5 个，接入 issue 后另加 2（只读）或 4 个。
+- 配置完成后在聊天里发 `!func` 可确认工具已注册：默认 11 个只读检索/查询工具，配置可写仓库后增加 `create_issue` / `update_issue`，共 13 个。
 - 最后把这个 MCP server 绑定到目标流水线，模型才会看到这些工具。
 
 排障顺序：先 `curl <地址>/healthz` 看 `ready` 与每仓 `error`（此接口不需要鉴权），
 再用下面的探针验证 MCP 握手，最后才怀疑 LangBot 配置。
 
-**安全**：源码侧完全只读——不执行仓库中的任何代码，也不接受任意路径读取（`read_file` 只能读已索引的受版本控制文件，并拒绝 `..` 与绝对路径）。唯一的写入面是 issue，且实现上只有「建 issue / 评论 / 改状态与标签」四种动作，没有任何删除端点，最坏后果是多一条可被人工撤销的 issue。但本服务会把私有仓源码送进 LLM——请确认所用模型的数据策略，并把服务绑定在内网或 `127.0.0.1`。
+**安全**：源码侧完全只读——不执行仓库中的任何代码，也不接受任意路径读取（`read_file` 只能读已索引的受版本控制文件，并拒绝 `..` 与绝对路径）。唯一的写入面是 issue，且实现上只有「创建 issue / 追加评论 / 修改标题与正文 / 修改状态与标签」，没有任何删除端点，最坏后果是产生可被人工撤销的 issue 内容变更。但本服务会把私有仓源码送进 LLM——请确认所用模型的数据策略，并把服务绑定在内网或 `127.0.0.1`。
 
 ## issue 能力
 
-只有配了 `repos[].issues` 的仓库才会出现 issue 工具，`write` 决定挂不挂 `create_issue` / `update_issue`。
+issue / PR / Release 查询工具始终可用；只有配置了可写仓库时才会挂载 `create_issue` / `update_issue`，`repos[].issues.write` 决定该仓库能否写入。
 
 **为什么护栏在服务端**：消费方是 IM 里的小模型，「先调研再提」「别重复提」「别随手关」写进工具描述只是建议。凡是能硬校验的都在服务端拦：
 
@@ -190,7 +192,7 @@ LangBot 的 MCP 配置里新增一个 HTTP server：
 | 状态变更要理由 | `close` 必须同时给 `comment`（≥10 字结论）与 `reason`（`completed` / `not_planned`）；重复关闭已关闭的 issue 会被拒绝 |
 | 仓库必须对得上 | 有多个可写仓时 `repo` 不可省略；对未接入 issue 的仓库调用会明确说明原因，而不是退而求其次挑一个 |
 
-机器人提交的 issue 与评论都带来源标注（提交人 + `repoMcp` + 索引 commit），维护者可一眼分辨并追溯。
+机器人创建的 issue 带报告人和（源码仓可用时）索引 commit；机器人评论带 `repoMcp` 来源标注，维护者可一眼分辨并追溯。
 
 ## 检索语义
 
@@ -227,3 +229,4 @@ REPOMCP_PROBE_URL=https://你的域名/mcp REPOMCP_PROBE_TOKEN=你的token \
 - 符号提取是**语言感知的正则启发式**，不是完整语法分析。选它是为了保住零依赖与 `CGO_ENABLED=0` 交叉编译；代价是复杂泛型签名、宏生成的定义可能漏抽。`search_code` 的全文检索不受此影响。
 - 索引常驻内存，随仓库规模线性增长。百万行级仓库请留意进程内存。
 - clone 使用 `--depth 200`，`git_history` 只能看到最近 200 次提交。
+- `edit_title` / `edit_body` 无法从 GitHub 侧证明当前会话就是原 issue 报告人；归属核对仍由调用方技能约束。`adminReporters` 也是工具路由护栏，不是独立认证机制，安全边界仍是 MCP Bearer token。

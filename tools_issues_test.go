@@ -16,8 +16,8 @@ import (
 // TestRenderIssueBody 覆盖正文渲染的段落结构契约：
 // 通用段落（问题描述 / 复现 / 环境）+ 源码仓调研结论 + 附件段 + 署名（防双署名）。
 func TestRenderIssueBody(t *testing.T) {
-	src := &Repo{Name: "example-source", HasCode: true}
-	fb := &Repo{Name: "example-feedback", HasCode: false}
+	src := &Repo{Name: "source", HasCode: true}
+	fb := &Repo{Name: "feedback", HasCode: false}
 	srv := &Server{store: NewStore(nil)} // 无仓库：shortHead 返回空，署名回退 "-"
 
 	tests := []struct {
@@ -112,8 +112,8 @@ func TestRenderIssueBody(t *testing.T) {
 // TestValidateCreateArgs 覆盖 create_issue 的必填与调研字段校验：
 // env 必填、confidence 按仓库类型分支、evidence 校验、reporter/title/body 长度。
 func TestValidateCreateArgs(t *testing.T) {
-	src := &Repo{Name: "example-source", HasCode: true}
-	fb := &Repo{Name: "example-feedback", HasCode: false}
+	src := &Repo{Name: "source", HasCode: true}
+	fb := &Repo{Name: "feedback", HasCode: false}
 	longBody := "测试正文内容需要超过二十个字才能通过长度校验要求哦"
 
 	tests := []struct {
@@ -202,7 +202,7 @@ func TestStripIssuePrefix(t *testing.T) {
 
 // TestValidateCreateArgsTitlePrefix 覆盖标题前缀硬校验（spec §9 五种前缀）。
 func TestValidateCreateArgsTitlePrefix(t *testing.T) {
-	fb := &Repo{Name: "example-feedback", HasCode: false}
+	fb := &Repo{Name: "feedback", HasCode: false}
 	longBody := "测试正文内容需要超过二十个字才能通过长度校验要求哦"
 	valid := []string{"[Bug] 崩溃", "[Feature] 批量导出", "[Question] 怎么用", "[许愿] 导出", "[争议] 工具栏"}
 	for _, title := range valid {
@@ -322,9 +322,9 @@ func TestCreateIssueContinuesWhenAllNativeAttachmentsFail(t *testing.T) {
 	var createdBody string
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource":
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/example-repo":
 			_, _ = w.Write([]byte(`{"id":1026542182}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/example-owner/ExampleSource/issues":
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/example-owner/example-repo/issues":
 			createCalls++
 			var payload struct {
 				Title string `json:"title"`
@@ -342,7 +342,7 @@ func TestCreateIssueContinuesWhenAllNativeAttachmentsFail(t *testing.T) {
 				"title":    payload.Title,
 				"body":     payload.Body,
 				"state":    "open",
-				"html_url": "https://github.com/example-owner/ExampleSource/issues/19",
+				"html_url": "https://github.com/example-owner/example-repo/issues/19",
 			})
 		default:
 			http.NotFound(w, r)
@@ -351,7 +351,7 @@ func TestCreateIssueContinuesWhenAllNativeAttachmentsFail(t *testing.T) {
 	defer github.Close()
 	repo := &Repo{
 		Name:       "fork",
-		Slug:       "example-owner/ExampleSource",
+		Slug:       "example-owner/example-repo",
 		HasCode:    false,
 		IssueRead:  true,
 		IssueWrite: true,
@@ -417,18 +417,18 @@ func newUpdateIssueMediaFixture(t *testing.T, uploadFailures map[int]error) *upd
 	}
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource":
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/example-repo":
 			_, _ = w.Write([]byte(`{"id":1026542182}`))
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource/issues/7":
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/example-repo/issues/7":
 			_, _ = w.Write([]byte(`{
 				"number":7,
 				"title":"[Bug] 评论附件测试",
 				"state":"open",
 				"body":"原正文",
-				"html_url":"https://github.com/example-owner/ExampleSource/issues/7",
+				"html_url":"https://github.com/example-owner/example-repo/issues/7",
 				"comments":0
 			}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/example-owner/ExampleSource/issues/7/comments":
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/example-owner/example-repo/issues/7/comments":
 			var payload struct {
 				Body string `json:"body"`
 			}
@@ -438,8 +438,8 @@ func newUpdateIssueMediaFixture(t *testing.T, uploadFailures map[int]error) *upd
 			}
 			fixture.comments = append(fixture.comments, payload.Body)
 			w.WriteHeader(http.StatusCreated)
-		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/example-owner/ExampleSource/issues/7/labels/"):
-			fixture.removedLabels = append(fixture.removedLabels, strings.TrimPrefix(r.URL.Path, "/repos/example-owner/ExampleSource/issues/7/labels/"))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/example-owner/example-repo/issues/7/labels/"):
+			fixture.removedLabels = append(fixture.removedLabels, strings.TrimPrefix(r.URL.Path, "/repos/example-owner/example-repo/issues/7/labels/"))
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
@@ -448,7 +448,7 @@ func newUpdateIssueMediaFixture(t *testing.T, uploadFailures map[int]error) *upd
 	t.Cleanup(github.Close)
 	repo := &Repo{
 		Name:       "fork",
-		Slug:       "example-owner/ExampleSource",
+		Slug:       "example-owner/example-repo",
 		IssueRead:  true,
 		IssueWrite: true,
 		GHToken:    "token",

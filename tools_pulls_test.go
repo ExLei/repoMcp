@@ -33,7 +33,7 @@ func TestSplitReporter(t *testing.T) {
 
 func TestIsAdminReporter(t *testing.T) {
 	srv := &Server{cfg: &Config{AdminReporters: []string{"管理员甲", "100000001", "老张(88001)"}}}
-	admins := []string{"管理员甲", "管理员甲(QQ100000001)", "100000001", "老张", "老张(88001)", "路人(100000001)", "　(100000001)", "(100000001)"}
+	admins := []string{"管理员甲", "管理员甲(QQ100000001)", "100000001", "老张", "老张(88001)", "普通用户(QQ100000001)", "　(100000001)", "(100000001)"}
 	others := []string{"", "路人", "路人(123)", "张三(QQ12345)"}
 	for _, a := range admins {
 		if !srv.isAdminReporter(a) {
@@ -49,8 +49,8 @@ func TestIsAdminReporter(t *testing.T) {
 
 func newTestSrv() *Server {
 	repos := []*Repo{
-		{Name: "feedback", Slug: "example-owner/ExampleFeedback", IssueRead: true},
-		{Name: "qc", Slug: "example-owner/ExampleSource", IssueRead: true, IssueWrite: true},
+		{Name: "feedback", Slug: "example-owner/feedback-repo", IssueRead: true},
+		{Name: "source", Slug: "example-owner/source-repo", IssueRead: true, IssueWrite: true},
 	}
 	return &Server{store: NewStore(repos), cfg: &Config{GitHubToken: "tok"}}
 }
@@ -59,12 +59,12 @@ func TestResolveReadRepo(t *testing.T) {
 	srv := newTestSrv()
 
 	r, err := srv.resolveReadRepo(map[string]any{"repo": "feedback"})
-	if err != nil || r.Slug != "example-owner/ExampleFeedback" {
+	if err != nil || r.Slug != "example-owner/feedback-repo" {
 		t.Fatalf("短名解析失败: %v, %v", r, err)
 	}
 
-	r, err = srv.resolveReadRepo(map[string]any{"repo": "example-owner/AstrBot"})
-	if err != nil || r.Slug != "example-owner/AstrBot" || r.GHToken != "tok" {
+	r, err = srv.resolveReadRepo(map[string]any{"repo": "example-owner/example-repo"})
+	if err != nil || r.Slug != "example-owner/example-repo" || r.GHToken != "tok" {
 		t.Fatalf("任意公开仓库解析失败: %v, %v", r, err)
 	}
 
@@ -98,8 +98,8 @@ func TestResolveAdminWriteRepo(t *testing.T) {
 		t.Fatalf("管理员任意仓库失败: %v, %v", r, err)
 	}
 	// 管理员：配置短名
-	r, err = srv.resolveAdminWriteRepo(map[string]any{"repo": "qc"}, nil)
-	if err != nil || r.Name != "qc" {
+	r, err = srv.resolveAdminWriteRepo(map[string]any{"repo": "source"}, nil)
+	if err != nil || r.Name != "source" {
 		t.Fatalf("管理员配置短名失败: %v, %v", r, err)
 	}
 	// 非法
@@ -164,8 +164,8 @@ func TestPullStateText(t *testing.T) {
 }
 
 func TestPullMetaLine(t *testing.T) {
-	line := pullMetaLine(PR{Author: "example-owner", UpdatedAt: "2026-08-01"})
-	if !strings.Contains(line, "example-owner") || !strings.Contains(line, "2026-08-01") {
+	line := pullMetaLine(PR{Author: "example-contributor", UpdatedAt: "2026-08-01"})
+	if !strings.Contains(line, "example-contributor") || !strings.Contains(line, "2026-08-01") {
 		t.Errorf("pullMetaLine 输出缺字段: %q", line)
 	}
 }

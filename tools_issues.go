@@ -189,7 +189,7 @@ func (s *Server) resolveAdminWriteRepo(args map[string]any, cands []*Repo) (*Rep
 		if len(cands) == 1 {
 			return cands[0], nil
 		}
-		return nil, fmt.Errorf("必须指定 repo：owner/name 形式（如 example-owner/AstrBot）或配置短名")
+		return nil, fmt.Errorf("必须指定 repo：owner/name 形式（如 example-owner/example-repo）或配置短名")
 	}
 	if r, ok := s.store.Get(name); ok {
 		return r, nil
@@ -197,7 +197,7 @@ func (s *Server) resolveAdminWriteRepo(args map[string]any, cands []*Repo) (*Rep
 	if reRepoSlug.MatchString(name) {
 		return &Repo{Name: raw, Slug: raw, GHToken: s.cfg.GitHubToken}, nil
 	}
-	return nil, fmt.Errorf("未知仓库 %q：用 owner/name 形式（如 example-owner/AstrBot）或配置短名", raw)
+	return nil, fmt.Errorf("未知仓库 %q：用 owner/name 形式（如 example-owner/example-repo）或配置短名", raw)
 }
 
 // splitReporter 拆「昵称(QQ号)」为（昵称, QQ号）；QQ 段剥离开头的 QQ 前缀（大小写不敏感）；
@@ -294,7 +294,7 @@ func (s *Server) resolveReadRepo(args map[string]any) (*Repo, error) {
 			return cands[0], nil
 		}
 		if len(cands) == 0 {
-			return nil, fmt.Errorf("必须指定 repo：任意公开仓库用 owner/name 形式（如 example-owner/AstrBot）")
+			return nil, fmt.Errorf("必须指定 repo：任意公开仓库用 owner/name 形式（如 example-owner/example-repo）")
 		}
 		return nil, fmt.Errorf("必须指定 repo：配置短名（%s）或任意公开仓库 owner/name", issueRepoList(cands))
 	}
@@ -307,7 +307,7 @@ func (s *Server) resolveReadRepo(args map[string]any) (*Repo, error) {
 	if reRepoSlug.MatchString(name) {
 		return &Repo{Name: raw, Slug: raw, GHToken: s.cfg.GitHubToken}, nil
 	}
-	return nil, fmt.Errorf("未知仓库 %q：用配置短名或 owner/name 形式（如 example-owner/AstrBot）", raw)
+	return nil, fmt.Errorf("未知仓库 %q：用配置短名或 owner/name 形式（如 example-owner/example-repo）", raw)
 }
 
 // ── 工具定义 ────────────────────────────────────────────────
@@ -318,12 +318,12 @@ func (s *Server) issueToolDefs() []toolDef {
 	readable := s.issueRepos(false)
 	writable := s.issueRepos(true)
 
-	repoDesc := "仓库：配置短名（" + issueRepoListAnnotated(readable) + "），或任意公开仓库 owner/name（如 example-owner/AstrBot）"
+	repoDesc := "仓库：配置短名（" + issueRepoListAnnotated(readable) + "），或任意公开仓库 owner/name（如 example-owner/example-repo）"
 	if len(readable) == 1 {
 		repoDesc += "（只有一个配置仓库，可省略）"
 	}
 	if len(readable) == 0 {
-		repoDesc = "任意公开仓库 owner/name（如 example-owner/AstrBot）"
+		repoDesc = "任意公开仓库 owner/name（如 example-owner/example-repo）"
 	}
 
 	defs := []toolDef{

@@ -10,7 +10,7 @@ import (
 
 func TestGitHubRepoID(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/repos/example-owner/ExampleFeedback" {
+		if r.Method != http.MethodGet || r.URL.Path != "/repos/example-owner/feedback-repo" {
 			t.Fatalf("request=%s %s", r.Method, r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer token" {
@@ -22,7 +22,7 @@ func TestGitHubRepoID(t *testing.T) {
 	defer srv.Close()
 
 	gh := NewGitHub(srv.URL, time.Second)
-	id, err := gh.RepoID(context.Background(), "token", "example-owner/ExampleFeedback")
+	id, err := gh.RepoID(context.Background(), "token", "example-owner/feedback-repo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestGitHubRepoIDRejectsMissingID(t *testing.T) {
 	defer srv.Close()
 
 	gh := NewGitHub(srv.URL, time.Second)
-	if _, err := gh.RepoID(context.Background(), "token", "example-owner/ExampleFeedback"); err == nil {
+	if _, err := gh.RepoID(context.Background(), "token", "example-owner/feedback-repo"); err == nil {
 		t.Fatal("GitHub 仓库响应缺少有效 id 时必须失败")
 	}
 }

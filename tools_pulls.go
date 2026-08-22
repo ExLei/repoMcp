@@ -27,7 +27,7 @@ func pullStateText(p PR) string {
 
 // pullToolDefs 产出 PR 查询工具。只读，不依赖配置仓库，任何部署都挂载。
 func (s *Server) pullToolDefs() []toolDef {
-	repoDesc := "仓库：配置短名，或任意公开仓库 owner/name（如 example-owner/AstrBot）；只有一个配置仓库时可省略"
+	repoDesc := "仓库：配置短名，或任意公开仓库 owner/name（如 example-owner/example-repo）；只有一个配置仓库时可省略"
 	return []toolDef{
 		{
 			Name:  "search_pulls",
