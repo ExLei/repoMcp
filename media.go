@@ -64,7 +64,7 @@ type attachmentUploader interface {
 }
 
 // mediaResult 是单次媒体处理的产物。单项失败只增加 failed/warnings，
-// 已通过校验并上传成功的原生附件仍按输入顺序渲染进正文。
+// 已通过校验并上传成功的原生附件仍按输入顺序渲染进正文或评论。
 type mediaResult struct {
 	md         string
 	requested  int

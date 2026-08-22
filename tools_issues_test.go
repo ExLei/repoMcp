@@ -395,3 +395,216 @@ func TestCreateIssueContinuesWhenAllNativeAttachmentsFail(t *testing.T) {
 		t.Fatalf("tool response=%s", out)
 	}
 }
+
+type updateIssueMediaFixture struct {
+	server        *Server
+	comments      []string
+	removedLabels []string
+	uploader      *fakeAttachmentUploader
+	image         string
+}
+
+func newUpdateIssueMediaFixture(t *testing.T, uploadFailures map[int]error) *updateIssueMediaFixture {
+	t.Helper()
+	sourceDir := t.TempDir()
+	imagePath := filepath.Join(sourceDir, "comment.png")
+	if err := os.WriteFile(imagePath, validPNG(t, 40, 30), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fixture := &updateIssueMediaFixture{
+		uploader: &fakeAttachmentUploader{failAt: uploadFailures},
+		image:    imagePath,
+	}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource":
+			_, _ = w.Write([]byte(`{"id":1026542182}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/example-owner/ExampleSource/issues/7":
+			_, _ = w.Write([]byte(`{
+				"number":7,
+				"title":"[Bug] 评论附件测试",
+				"state":"open",
+				"body":"原正文",
+				"html_url":"https://github.com/example-owner/ExampleSource/issues/7",
+				"comments":0
+			}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/example-owner/ExampleSource/issues/7/comments":
+			var payload struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			fixture.comments = append(fixture.comments, payload.Body)
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/example-owner/ExampleSource/issues/7/labels/"):
+			fixture.removedLabels = append(fixture.removedLabels, strings.TrimPrefix(r.URL.Path, "/repos/example-owner/ExampleSource/issues/7/labels/"))
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(github.Close)
+	repo := &Repo{
+		Name:       "fork",
+		Slug:       "example-owner/ExampleSource",
+		IssueRead:  true,
+		IssueWrite: true,
+		GHToken:    "token",
+	}
+	fixture.server = &Server{
+		cfg: &Config{
+			MaxResponseBytes: 8192,
+			MediaSourceDir:   sourceDir,
+			MediaTempDir:     t.TempDir(),
+			AdminReporters:   []string{"admin"},
+			mediaTimeout:     10 * time.Second,
+		},
+		store:              NewStore([]*Repo{repo}),
+		gh:                 NewGitHub(github.URL, 10*time.Second),
+		attachmentUploader: fixture.uploader,
+	}
+	return fixture
+}
+
+// TestUpdateIssueCommentIncludesNativeAttachments catches routing update_issue
+// images away from the comment body or placing them after the provenance marker.
+func TestUpdateIssueCommentIncludesNativeAttachments(t *testing.T) {
+	fixture := newUpdateIssueMediaFixture(t, nil)
+	out, err := fixture.server.toolUpdateIssue(context.Background(), map[string]any{
+		"repo":     "fork",
+		"number":   7,
+		"action":   "comment",
+		"comment":  "补充一张能够复现问题的截图。",
+		"images":   fixture.image,
+		"reporter": "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.comments) != 1 {
+		t.Fatalf("comment calls=%d", len(fixture.comments))
+	}
+	body := fixture.comments[0]
+	url := "https://github.com/user-attachments/assets/11111111-1111-4111-8111-111111111111"
+	textPos := strings.Index(body, "补充一张能够复现问题的截图。")
+	mediaPos := strings.Index(body, "## 附件")
+	urlPos := strings.Index(body, url)
+	signaturePos := strings.Index(body, "<sub>— 由聊天机器人经 repoMcp 提交</sub>")
+	if textPos < 0 || mediaPos <= textPos || urlPos <= mediaPos || signaturePos <= urlPos {
+		t.Fatalf("评论应按文字、附件、来源标注排序，实际：\n%s", body)
+	}
+	if !strings.Contains(out, "已追加评论。") ||
+		!strings.Contains(out, "请求附件 1 个：成功 1 个，失败 0 个") {
+		t.Fatalf("tool response=%s", out)
+	}
+}
+
+// TestUpdateIssueAllowsImageOnlyComment catches validation that still requires
+// comment text even when a native attachment can form the comment body.
+func TestUpdateIssueAllowsImageOnlyComment(t *testing.T) {
+	fixture := newUpdateIssueMediaFixture(t, nil)
+	out, err := fixture.server.toolUpdateIssue(context.Background(), map[string]any{
+		"repo":     "fork",
+		"number":   7,
+		"action":   "comment",
+		"images":   fixture.image,
+		"reporter": "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.comments) != 1 {
+		t.Fatalf("comment calls=%d", len(fixture.comments))
+	}
+	if !strings.Contains(fixture.comments[0], "## 附件") ||
+		!strings.Contains(fixture.comments[0], "https://github.com/user-attachments/assets/") {
+		t.Fatalf("纯图片评论缺少附件：\n%s", fixture.comments[0])
+	}
+	if !strings.Contains(out, "已追加评论。") {
+		t.Fatalf("tool response=%s", out)
+	}
+}
+
+// TestUpdateIssueSkipsEmptyCommentWhenAllAttachmentsFail catches publishing a
+// provenance-only comment after an image-only request produces no attachment.
+func TestUpdateIssueSkipsEmptyCommentWhenAllAttachmentsFail(t *testing.T) {
+	fixture := newUpdateIssueMediaFixture(t, map[int]error{0: errors.New("session expired")})
+	_, err := fixture.server.toolUpdateIssue(context.Background(), map[string]any{
+		"repo":     "fork",
+		"number":   7,
+		"action":   "comment",
+		"images":   fixture.image,
+		"reporter": "admin",
+	})
+	if err == nil {
+		t.Fatal("纯图片全部上传失败时应返回错误")
+	}
+	if len(fixture.comments) != 0 {
+		t.Fatalf("不应发布空评论，comment calls=%d", len(fixture.comments))
+	}
+	if len(fixture.uploader.uploads) != 1 {
+		t.Fatalf("附件上传次数=%d", len(fixture.uploader.uploads))
+	}
+	if !strings.Contains(err.Error(), "评论未提交") ||
+		!strings.Contains(err.Error(), "请求附件 1 个：成功 0 个，失败 1 个") ||
+		!strings.Contains(err.Error(), "附件 1 上传失败") {
+		t.Fatalf("错误应说明评论未提交及附件失败原因：%v", err)
+	}
+}
+
+// TestUpdateIssueTextCommentSurvivesAttachmentFailure catches treating a
+// failed optional attachment as a reason to discard the useful text comment.
+func TestUpdateIssueTextCommentSurvivesAttachmentFailure(t *testing.T) {
+	fixture := newUpdateIssueMediaFixture(t, map[int]error{0: errors.New("session expired")})
+	out, err := fixture.server.toolUpdateIssue(context.Background(), map[string]any{
+		"repo":     "fork",
+		"number":   7,
+		"action":   "comment",
+		"comment":  "先补充文字结论，截图失败也不要丢失这条评论。",
+		"images":   fixture.image,
+		"reporter": "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.comments) != 1 {
+		t.Fatalf("comment calls=%d", len(fixture.comments))
+	}
+	if !strings.Contains(fixture.comments[0], "先补充文字结论") ||
+		strings.Contains(fixture.comments[0], "## 附件") {
+		t.Fatalf("失败开放评论内容异常：\n%s", fixture.comments[0])
+	}
+	if !strings.Contains(out, "请求附件 1 个：成功 0 个，失败 1 个") ||
+		!strings.Contains(out, "session expired") {
+		t.Fatalf("tool response=%s", out)
+	}
+}
+
+// TestUpdateIssueImageFailureKeepsLabelChanges catches an optional attachment
+// failure returning before an independently requested label update is applied.
+func TestUpdateIssueImageFailureKeepsLabelChanges(t *testing.T) {
+	fixture := newUpdateIssueMediaFixture(t, map[int]error{0: errors.New("session expired")})
+	out, err := fixture.server.toolUpdateIssue(context.Background(), map[string]any{
+		"repo":          "fork",
+		"number":        7,
+		"action":        "comment",
+		"images":        fixture.image,
+		"remove_labels": "bug",
+		"reporter":      "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.comments) != 0 {
+		t.Fatalf("不应发布空评论，comment calls=%d", len(fixture.comments))
+	}
+	if len(fixture.removedLabels) != 1 || fixture.removedLabels[0] != "bug" {
+		t.Fatalf("removed labels=%v", fixture.removedLabels)
+	}
+	if !strings.Contains(out, "请求附件 1 个：成功 0 个，失败 1 个") ||
+		!strings.Contains(out, "已移除标签：bug") {
+		t.Fatalf("tool response=%s", out)
+	}
+}

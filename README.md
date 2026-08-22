@@ -51,7 +51,7 @@
 | 工具 | 用途 | 权限 |
 |---|---|---|
 | `create_issue` | 代用户提交 issue，正文由服务端按模板渲染；`images` 会尝试上传为 GitHub 原生 `user-attachments`，附件失败不阻止 issue 创建 | 仅配置的可写仓库；管理员（`adminReporters`）可对任意仓库（token 可访问的）写入 |
-| `update_issue` | 追加评论、关闭、重开、增删标签 | 同上；**追加评论（action=comment）仅管理员可执行** |
+| `update_issue` | 追加评论、关闭、重开、增删标签；`images` 在 `edit_body` 时附到正文，在 `comment` / `close` / `reopen` 时附到评论，并支持纯图片评论 | 同上；**追加评论（action=comment）仅管理员可执行** |
 
 服务在 `initialize` 时会下发 `instructions`，向模型声明可用仓库、各仓的 issue 能力、工具选择规则，以及**必须引用来源、检索无果时不得编造**。
 
@@ -124,7 +124,7 @@
 
 issue REST 与原生附件使用两套独立凭据：`githubToken` PAT 只负责 issue 查询/写入；`githubAttachmentSessionFile` 中的浏览器 Session 只负责 GitHub 网页原生附件协议，不替换 PAT。不存在 GitHub 媒体仓库，也不存在 repoMcp 服务器永久图床。
 
-媒体接收规则：URL 下载只接受 `imageDownloadHosts` 白名单域名且解析为公网地址（默认拒绝私网，防 SSRF）；本地路径只允许 `mediaSourceDir` 内的文件；单个附件 ≤100MB、单次最多 10 个；类型限 png/jpg/gif/webp 图片与 mp4/mov 视频（按魔数嗅探，不信扩展名）。校验后流式上传到 GitHub，issue 正文引用 `https://github.com/user-attachments/assets/<UUID>`。成功项按输入顺序保留；部分或全部失败仍创建/更新 issue，工具结果会报告请求、成功、失败数量与逐项原因。
+媒体接收规则：URL 下载只接受 `imageDownloadHosts` 白名单域名且解析为公网地址（默认拒绝私网，防 SSRF）；本地路径只允许 `mediaSourceDir` 内的文件；单个附件 ≤100MB、单次最多 10 个；类型限 png/jpg/gif/webp 图片与 mp4/mov 视频（按魔数嗅探，不信扩展名）。校验后流式上传到 GitHub，issue 正文或评论引用 `https://github.com/user-attachments/assets/<UUID>`。成功项按输入顺序保留；部分或全部失败不阻断已有正文、评论文字或状态更新，工具结果会报告请求、成功、失败数量与逐项原因。纯图片评论全部上传失败时不发布空评论。
 
 repoMcp 只清理自己在 `mediaTempDir` 创建的 URL 下载 staging 文件；不会删除 AstrBot 拥有的 `mediaSourceDir` 源文件。进程崩溃遗留的 repoMcp 临时文件超过 24 小时后清理。
 

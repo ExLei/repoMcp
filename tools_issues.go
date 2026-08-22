@@ -402,6 +402,8 @@ func (s *Server) issueToolDefs() []toolDef {
 				"再 edit_title（标题带新前缀）+add_labels 补标签；edit_body 失败则不改标题；\n" +
 				"- 署名核不上或非本机器人代提的 issue → 绝不 edit_title/edit_body；只有管理员可 comment 说明情况，把决定权留给维护者；\n" +
 				"- 只有用户明确要求、或问题确已解决/确认不做时才 close，且必须用 comment 写清结论；\n" +
+				"- images：action=edit_body 时附到正文；action=comment / close / reopen 时附到评论；" +
+				"action=comment 可只传 images 发布纯图片评论，附件全部失败时不会发布空评论；\n" +
 				"- 不要为了「清理」而批量关闭，一次只处理一个编号。",
 			Schema: s.updateIssueSchema(writeDesc),
 			Handle: s.toolUpdateIssue,
@@ -435,12 +437,12 @@ func (s *Server) createIssueSchema(writeDesc string) map[string]any {
 	return obj(props, "title", "body", "env")
 }
 
-// updateIssueSchema 的 images 仅对 action=edit_body 生效。
+// updateIssueSchema 的 images 按 action 路由到正文或评论。
 func (s *Server) updateIssueSchema(writeDesc string) map[string]any {
 	props := map[string]any{
 		"number":        integer("issue 编号（不带 #）", 1, 1000000),
 		"action":        str("comment（默认，仅评论）/ close（关闭）/ reopen（重新打开）/ edit_title（改标题）/ edit_body（改正文）"),
-		"comment":       str("要追加的评论。close 与 reopen 必填，需说明结论或理由"),
+		"comment":       str("要追加的评论文字。action=comment 可省略文字并只传 images；close 与 reopen 必填，需说明结论或理由"),
 		"reason":        str("关闭原因，close 时必填：completed=已解决 / not_planned=不予处理或无法复现"),
 		"title":         str("新标题，action=edit_title 时必填，长度 6–200 字"),
 		"body":          str("新正文，action=edit_body 时必填。会替换整篇正文，请保留用户原始报告内容，不足 20 字会被拒绝"),
@@ -448,8 +450,8 @@ func (s *Server) updateIssueSchema(writeDesc string) map[string]any {
 		"remove_labels": str("要移除的标签，逗号分隔"),
 		"reporter":      str("操作者：昵称(QQ号)，如 张三(QQ12345)。追加评论（action=comment）仅管理员可执行；管理员的其他修改操作可作用于任意仓库（token 可访问的），非管理员仅限配置仓库"),
 		"repo":          str(writeDesc),
-		"images": str("要随正文更新的相关截图或视频：本地路径或 URL，多个用逗号或换行分隔；" +
-			"仅在 action=edit_body 时生效；上传失败不阻止正文更新，但会明确报告缺失"),
+		"images": str("相关截图或视频：本地路径或 URL，多个用逗号或换行分隔；action=edit_body 时附到正文，" +
+			"action=comment / close / reopen 时附到评论；上传失败不阻止已有文字或状态更新，但会明确报告缺失"),
 	}
 	return obj(props, "number")
 }
@@ -901,14 +903,15 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 		return "", fmt.Errorf("number 必须是正整数（issue 编号）")
 	}
 	comment := strings.TrimSpace(argStr(args, "comment"))
+	images := splitList(argStr(args, "images"))
 	addLabels := splitList(argStr(args, "add_labels"))
 	rmLabels := splitList(argStr(args, "remove_labels"))
 
 	var edit IssueEdit
 	switch action {
 	case "comment":
-		if comment == "" && len(addLabels) == 0 && len(rmLabels) == 0 {
-			return "", fmt.Errorf("action=comment 时至少要给出 comment 或标签变更")
+		if comment == "" && len(images) == 0 && len(addLabels) == 0 && len(rmLabels) == 0 {
+			return "", fmt.Errorf("action=comment 时至少要给出 comment、images 或标签变更")
 		}
 	case "close":
 		if utf8.RuneCountInString(comment) < issueNoteMinRunes {
@@ -943,27 +946,43 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 	}
 
 	// 先读当前状态：重复关闭一个已关闭的 issue 只会制造噪声通知；
-	// 媒体保存放在存在性校验之后，避免给错误编号留下孤儿附件。
+	// 媒体上传放在存在性与状态校验之后，避免给无效更新留下孤儿附件。
 	cur, _, err := s.gh.Get(ctx, r, number)
 	if err != nil {
 		return "", err
-	}
-	var media mediaResult
-	if action == "edit_body" {
-		media = s.processMedia(ctx, r, splitList(argStr(args, "images")))
-		if media.md != "" {
-			edit.Body = insertMediaSection(edit.Body, media.md)
-		}
-	} else if images := splitList(argStr(args, "images")); len(images) > 0 {
-		media.requested = len(images)
-		media.failed = len(images)
-		media.warnings = append(media.warnings, "images 仅在 action=edit_body 时随正文更新，本次未附带")
 	}
 	if edit.State == "closed" && cur.State == "closed" {
 		return "", fmt.Errorf("#%d 已经是关闭状态（%s），无需重复关闭。若要补充信息请用 action=comment", number, issueStateText(cur))
 	}
 	if edit.State == "open" && cur.State == "open" {
 		return "", fmt.Errorf("#%d 当前就是开启状态，无需重新打开", number)
+	}
+
+	var media mediaResult
+	commentMediaAction := action == "comment" || action == "close" || action == "reopen" || action == "open"
+	switch {
+	case action == "edit_body":
+		media = s.processMedia(ctx, r, images)
+		if media.md != "" {
+			edit.Body = insertMediaSection(edit.Body, media.md)
+		}
+	case commentMediaAction:
+		media = s.processMedia(ctx, r, images)
+	case len(images) > 0:
+		media.requested = len(images)
+		media.failed = len(images)
+		media.warnings = append(media.warnings, "images 仅在 action=edit_body / comment / close / reopen 时生效，本次未附带")
+	}
+	if action == "comment" && comment == "" && len(images) > 0 && media.md == "" &&
+		len(addLabels) == 0 && len(rmLabels) == 0 {
+		detail := strings.Join(media.warnings, "；")
+		if detail == "" {
+			detail = "没有附件上传成功"
+		}
+		return "", fmt.Errorf(
+			"评论未提交：请求附件 %d 个：成功 0 个，失败 %d 个。%s",
+			media.requested, media.failed, detail,
+		)
 	}
 
 	var dropped []string
@@ -974,8 +993,13 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 	edit.RemoveLabels = rmLabels
 
 	// 评论先发：状态变更会触发通知，通知里带上结论比事后补评论更清楚。
-	if comment != "" {
-		if err := s.gh.Comment(ctx, r, number, s.renderComment(comment)); err != nil {
+	commentMedia := ""
+	if commentMediaAction {
+		commentMedia = media.md
+	}
+	commentPosted := comment != "" || commentMedia != ""
+	if commentPosted {
+		if err := s.gh.Comment(ctx, r, number, s.renderComment(comment, commentMedia)); err != nil {
 			return "", err
 		}
 	}
@@ -996,7 +1020,7 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 	default:
 		w.line(fmt.Sprintf("已更新 #%d：%s", iss.Number, truncate(iss.Title, 120)))
 	}
-	if comment != "" {
+	if commentPosted {
 		w.line("已追加评论。")
 	}
 	if edit.Title != "" {
@@ -1021,9 +1045,24 @@ func (s *Server) toolUpdateIssue(ctx context.Context, args map[string]any) (stri
 	return w.String(), nil
 }
 
-// renderComment 给评论加上来源标注：仓库里必须能一眼看出哪些内容是机器人写的。
-func (s *Server) renderComment(body string) string {
-	return strings.TrimSpace(body) + "\n\n<sub>— 由聊天机器人经 repoMcp 提交</sub>\n"
+// renderComment 给评论追加附件与来源标注：仓库里必须能一眼看出哪些内容是机器人写的。
+func (s *Server) renderComment(body, media string) string {
+	var b strings.Builder
+	if body = strings.TrimSpace(body); body != "" {
+		b.WriteString(body)
+	}
+	if media = strings.TrimSpace(media); media != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("## 附件\n\n")
+		b.WriteString(media)
+	}
+	if b.Len() > 0 {
+		b.WriteString("\n\n")
+	}
+	b.WriteString("<sub>— 由聊天机器人经 repoMcp 提交</sub>\n")
+	return b.String()
 }
 
 // ── 公共辅助 ────────────────────────────────────────────────
